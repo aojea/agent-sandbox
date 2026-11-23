@@ -28,6 +28,7 @@ TOC is auto-generated via `make toc-update`.
   - [Alternative 1: Standalone <code>SandboxNetworkPolicy</code> and <code>SandboxNetworkBinding</code> CRDs with embedded CEL engine](#alternative-1-standalone-sandboxnetworkpolicy-and-sandboxnetworkbinding-crds-with-embedded-cel-engine)
   - [Alternative 2: Exposing <code>HTTP_PROXY=unix:///run/agents.net/egress.sock</code> in <code>ExplicitProxy</code> mode](#alternative-2-exposing-http_proxyunixrunagentsnetegresssock-in-explicitproxy-mode)
   - [Alternative 3: Hardcoding a single upstream authentication mechanism](#alternative-3-hardcoding-a-single-upstream-authentication-mechanism)
+  - [Alternative 4: Requiring <code>DRAConsumableCapacity</code> (<code>allowMultipleAllocations: true</code>)](#alternative-4-requiring-draconsumablecapacity-allowmultipleallocations-true)
 <!-- /toc -->
 
 ## Summary
@@ -50,10 +51,10 @@ Existing approaches force painful trade-offs:
 
 - **Promote `agents.net` as a vendor-neutral standard** for sandbox network interception (`CONNECT` + RFC 9298 `connect-udp` over per-Pod Unix domain sockets, `Boundary-Reason`, `AGENT_CA_CERT`) and upstream forwarding (`HTTP/1.1`, `HTTP/2`, or `HTTP/3` MASQUE + RFC 9209 `Proxy-Status` + attested `Agents-Net-*` identity headers).
 - **Keep `agent-sandbox` strictly focused on plumbing** with zero new policy or binding CRDs. Expose configuration directly in `SandboxBlueprint.network` (shared by `Sandbox` and `SandboxTemplate`) and standard Kubernetes DRA `DeviceClass` / `ResourceClaim` `OpaqueDeviceConfiguration` (supporting raw `Pod` workloads as well).
-- **Reuse Kubernetes DRA + NRI mechanics (DraNet pattern):** one shared consumable-capacity `ResourceSlice` device per node (`sandbox-net`), slow-path DRA preparation with zero CDI files, and fast-path NRI hooks running synchronously during `RunPodSandbox` before any container starts.
+- **Reuse simple GA Kubernetes DRA + NRI mechanics (DraNet pattern):** standard GA `resource.k8s.io/v1` per-pod slot devices auto-sized to `node.Status.Allocatable.Pods()` (zero alpha/beta DRA feature gates), slow-path DRA preparation with zero CDI files, and fast-path NRI hooks running synchronously during `RunPodSandbox` before any container starts.
 - **Support both KEP-6313 and existing CNI clusters:** default to `PodNetworkIsolated` (loopback-only Pod network namespace with no CNI attachment or Pod IP), and provide backward-compatible `NetworkPolicyDenyAll` (controller-managed deny-all `NetworkPolicy` plus `NRI RunPodSandbox` non-loopback route flush).
 - **Support all four native Kubernetes upstream authentication modes** (`MTLS`, `SPIFFE`, `PodCertificate`, and `ServiceAccountToken`) while keeping private keys and tokens completely inaccessible to untrusted workload containers.
-- **Support declarative Pod CA trust (`caTrust`) and full multi-language proxy/CA env injection** (`AGENT_CA_CERT`, `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`, `NODE_EXTRA_CA_CERTS`, `HTTP_PROXY`/`http_proxy`, `NODE_USE_ENV_PROXY`, `GRPC_PROXY_EXP`, `JAVA_TOOL_OPTIONS`, etc.) with a `socketat`-bound `127.0.0.1:<port>` loopback listener for `ExplicitProxy`.
+- **Follow Kubernetes, `cert-manager`, `trust-manager`, and Gateway API certificate conventions:** support `ConfigMap`, `Secret` (strictly extracting `CERTIFICATE` PEM blocks only), `ClusterTrustBundle`, and `HostPath` uniformly on both `caTrust.sources` and `upstream.tls.caCertificateRefs`, with `AGENT_CA_CERT` + full multi-language CA/proxy env var injection and a parametrizable `socketat`-bound `127.0.0.1:<port>` (default `15001`) loopback listener for `ExplicitProxy`.
 - **Preserve `SandboxWarmPool` sub-second adoption** by keeping attested Pod/Sandbox/Claim identity synchronized via a node-scoped `core/v1` Pod informer and revoking pre-claim tunnels on adoption.
 
 ### Non-Goals
@@ -72,7 +73,7 @@ A platform team runs an egress portal (such as `gke-labs/service-portals`, Envoy
 
 #### Story 2: Workload owner customizes upstream, Pod CA trust, or private metadata per `SandboxTemplate`
 
-A team overrides `spec.network.upstream` on its `SandboxTemplate` to target a tenant-specific portal, selects `PodCertificate` or `SPIFFE` authentication, declares its inspection CA via `spec.network.caTrust` (`ConfigMap` or KEP-3257 `ClusterTrustBundle`), and passes team-specific metadata via `spec.network.parameters` (propagated via DRA `OpaqueDeviceConfiguration` and `Agents-Net-Param-*` headers).
+A team overrides `spec.network.upstream` on its `SandboxTemplate` to target a tenant-specific portal, selects `PodCertificate`, `MTLS`, or `SPIFFE` authentication, declares its inspection CA via `spec.network.caTrust` (`ConfigMap`, `cert-manager` `kubernetes.io/tls` `Secret`, or KEP-3257 `ClusterTrustBundle`), and passes team-specific metadata via `spec.network.parameters` (propagated via DRA `OpaqueDeviceConfiguration` and `Agents-Net-Param-*` headers).
 
 #### Story 3: Standalone Kubernetes `Pod` user adopts `agents.net` plumbing directly
 
@@ -106,7 +107,7 @@ An operator on a Kubernetes cluster whose CNI does not yet support loopback-only
               ▼
 +-------------------------------------------------------------------+
 | Node Plumbing DaemonSet: sandbox-net (DRA + NRI)                  |
-|  - DRA slow path: ResourceSlice (consumable capacity.sandboxes),  |
+|  - DRA slow path: GA ResourceSlice (slot-0..slot-<maxPods-1>),    |
 |    PrepareResourceClaims decodes DeviceClass+Claim Opaque params, |
 |    opens per-Pod egress.sock, materializes Pod CA bundles,        |
 |    checkpoints to tmpfs BoltDB                                    |
@@ -138,10 +139,11 @@ An operator on a Kubernetes cluster whose CNI does not yet support loopback-only
 [DraNet](https://github.com/google/dranet) demonstrates a clean separation of concerns in Kubernetes node networking that avoids CDI file churn and kubelet/runtime coupling:
 
 1. **DRA Slow Path (`PrepareResourceClaims` / `UnprepareResourceClaims`):**
-   - Each node advertises **one shared device** (`sandbox-net`) in its `ResourceSlice` with `allowMultipleAllocations: true` and consumable `capacity.sandboxes` (default `1000`, request policy `default: 1`, `validValues: [1]`).
-   - If the node daemon becomes unhealthy, it publishes a `NoSchedule` `DeviceTaint` (`sandbox-net.agents.x-k8s.io/unhealthy`) to stop new placements cleanly.
+   - Each node advertises lightweight per-pod slot devices (`slot-0`..`slot-<N-1>`) in standard GA `resource.k8s.io/v1` `ResourceSlice`(s), where `N` auto-detects `node.Status.Allocatable.Pods()` (defaulting to `110`, fitting inside one `ResourceSlice` under `ResourceSliceMaxDevices = 128`, and automatically chunking if `N > 128`). Because node pod capacity already bounds concurrent sandboxes on a node, this avoids requiring `DRAConsumableCapacity`, `DRADeviceTaints`, or `DRAExtendedResource` feature gates.
+   - If the node daemon becomes unhealthy, it withdraws its `ResourceSlice` entries cleanly (stopping new placements without disrupting running Pods and without requiring `DRADeviceTaints`).
    - `DeviceClass.spec.config[].opaque` carries cluster-wide defaults, while per-Pod `ResourceClaim.spec.devices.config[].opaque` overlays user upstream, CA trust, proxy, auth, and custom/private parameters.
    - `PrepareResourceClaims` decodes the layered parameters, creates `/run/sandbox-net/pods/<podUID>/egress/egress.sock`, resolves upstream auth, materializes any declarative Pod CA bundles, probes socket readiness, checkpoints state to memory-backed BoltDB, and returns **zero CDI devices**.
+   - Device readiness is reported on `ResourceClaim.status.devices` via a targeted `MergePatch` on the `status` subresource using least-privilege `resourceclaims/driver` (`associated-node:patch`) RBAC so immutable `status.allocation` is never rewritten.
 2. **NRI Fast Path (`RunPodSandbox` / `CreateContainer` / `StopPodSandbox` / `RemovePodSandbox` / `Synchronize`):**
    - `RunPodSandbox` executes synchronously **before any container is created or started**. Under `PodNetworkIsolated`, it verifies via `socketat.DoAtNSPath` + netlink that only loopback exists (rejecting `hostNetwork` or unexpected CNI interfaces). Under `NetworkPolicyDenyAll` (where enforcing CNIs also apply the `NetworkPolicy` during `RunPodSandbox`), it flushes routes on non-loopback interfaces so `tun0` cleanly owns default routes without conflict.
    - Under `ExplicitProxy`, `RunPodSandbox` also binds `127.0.0.1:<port>` inside the Pod's network namespace using the [`aojea/socketat`](https://github.com/aojea/socketat) mechanism (`runtime.LockOSThread()`, opening `/proc/<pid>/task/<tid>/ns/net`, `unix.Setns`, synchronous `net.Listen`, restoring the thread's original namespace) and attaches the resulting `net.Listener` to the Pod's tunnel pipeline. Once created, the listening FD lives in the Pod's loopback namespace while `Accept()` and forwarding run safely on host goroutines with zero namespace leakage.
@@ -155,7 +157,7 @@ Because Linux network interfaces belong to the Pod network namespace (never to i
 
 - **`TunSidecar` (default):** Injects one distroless native sidecar initContainer (`sandbox-net-tun2connect`, `restartPolicy: Always`) per Pod. It declares `NET_ADMIN` + `SETPCAP` solely to create `tun0` once and drop both capabilities before entering its packet loop. All workload containers stay at zero capabilities (`drop: ["ALL"]`) and receive zero `/dev/net/tun` or UDS mounts.
 - **`TunVM`:** For hypervisor/microVM runtimes (Kata, gVisor, Firecracker) that attach one `tun2connect` per microVM over vsock or Unix socket.
-- **`ExplicitProxy`:** Skips TUN creation and binds `127.0.0.1:<port>` (default `15001`) directly inside the Pod's loopback namespace via `socketat`, working even in loopback-only `PodNetworkIsolated` Pods with zero sidecar container. Because standard HTTP clients do not accept `HTTP_PROXY=unix://...`, `NRI CreateContainer` mounts `/run/agents.net/egress.sock` and injects the complete matrix of language-specific proxy env vars (non-clobbering, appending safely to `JAVA_TOOL_OPTIONS`):
+- **`ExplicitProxy`:** Skips TUN creation and binds `127.0.0.1:<port>` (parametrizable, defaulting to fixed `15001` so clients have a predictable convention without ephemeral-port churn) directly inside the Pod's loopback namespace via `socketat`, working even in loopback-only `PodNetworkIsolated` Pods with zero sidecar container. Both HTTPS (`CONNECT`) and plain HTTP absolute-form `HTTP_PROXY` requests are tunneled over upstream `CONNECT`. Because standard HTTP clients do not accept `HTTP_PROXY=unix://...`, `NRI CreateContainer` mounts `/run/agents.net/egress.sock` and injects the complete matrix of language-specific proxy env vars (non-clobbering, appending safely to `JAVA_TOOL_OPTIONS`):
   - `AGENTS_NET_EGRESS_SOCKET=/run/agents.net/egress.sock`, `AGENTS_NET_PROXY_URL=http://127.0.0.1:<port>`
   - Uppercase & lowercase: `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, `NO_PROXY`, `http_proxy`, `https_proxy`, `all_proxy`, `no_proxy` (`localhost,127.0.0.1,::1` + user `noProxy`)
   - Node.js 22+ & npm: `NODE_USE_ENV_PROXY=1`, `npm_config_proxy`, `npm_config_https_proxy`
@@ -164,7 +166,9 @@ Because Linux network interfaces belong to the Pod network namespace (never to i
 
 #### Declarative Pod CA Certificates (`agents.net` + Language Trust Env Vars)
 
-When an upstream performs TLS inspection or uses private internal CAs, `spec.network.caTrust` (and DRA `DeviceClass` defaults) declaratively defines Pod CA certificates from `ConfigMap`, Kubernetes KEP-3257 `ClusterTrustBundle`, or `HostPath` sources:
+When an upstream performs TLS inspection or uses private internal CAs, `spec.network.caTrust` (and DRA `DeviceClass` defaults) declaratively defines Pod CA certificates using standard Kubernetes, `cert-manager`, `trust-manager`, and Gateway API conventions (`SandboxCASource`: `ConfigMap`, `Secret`, KEP-3257 `ClusterTrustBundle`, or `HostPath`, with `ca.crt` as the default key):
+
+- **Safe `Secret` support (`cert-manager` compatible):** Because `cert-manager` writes `ca.crt` alongside `tls.crt`/`tls.key` inside `kubernetes.io/tls` Secrets (and `trust-manager` can target Secrets), `SandboxCASource` accepts `Secret` references scoped strictly to the Sandbox's namespace. `sandbox-net` parses PEM blocks and extracts **only valid X.509 `CERTIFICATE` blocks**, ensuring private keys are never written to `/var/run/agent-ca.pem` or mounted into the Pod. The same `SandboxCASource` list is reused on `upstream.tls.caCertificateRefs` (matching Gateway API `BackendTLSPolicy`).
 
 - **`AppendSystemRoots` (default) vs `Replace`:** Because `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE`, `GIT_SSL_CAINFO`, `AWS_CA_BUNDLE`, `CARGO_HTTP_CAINFO`, and `DENO_CERT` replace the runtime's trust store while `NODE_EXTRA_CA_CERTS` appends, `sandbox-net` writes two PEM files per Pod and mounts them read-only into every workload container:
   - `/var/run/agent-ca.pem` (standard system roots + custom CAs in `AppendSystemRoots` mode, or custom-only in `Replace` mode — matching `agents.net` Section 2.3.B)
@@ -217,9 +221,9 @@ spec:
       mode: InjectEnv                            # None | MountOnly | InjectEnv
       bundleMode: AppendSystemRoots              # AppendSystemRoots | Replace
       sources:
-        - type: ConfigMap                        # ConfigMap | ClusterTrustBundle | HostPath
-          configMapRef:
-            name: corp-proxy-ca
+        - type: Secret                           # ConfigMap | Secret | ClusterTrustBundle | HostPath
+          secretRef:
+            name: corp-proxy-ca                  # cert-manager kubernetes.io/tls Secret
             key: ca.crt
     proxy:                                       # used when adapterMode is ExplicitProxy
       port: 15001
@@ -230,8 +234,11 @@ spec:
       protocol: HTTP2                            # HTTP1 | HTTP2 | HTTP3
       tls:
         serverName: egress-portal.sandbox-system.svc
-        caBundleConfigMapRef:
-          name: portal-ca
+        caCertificateRefs:
+          - type: ConfigMap                      # ConfigMap | Secret | ClusterTrustBundle | HostPath
+            configMapRef:
+              name: portal-ca
+              key: ca.crt
         trustDomain: cluster.local
         acceptedSPIFFEIDs:
           - spiffe://cluster.local/ns/sandbox-system/sa/portal
@@ -264,29 +271,31 @@ Validation rules (CEL `XValidation`):
    - Add `SandboxNetworkSpec` to `SandboxBlueprint` and register nested apply-configuration externals in `dev/tools/client-gen-go.sh`.
    - Keep all API fields KAL-compliant (enums over booleans, slices over maps, explicit `+optional`/`+required`).
 2. **Controllers (`controllers/sandbox_network.go`, `controllers/sandbox_controller.go`, `extensions/controllers/`):**
-   - When `sandbox.Spec.Network != nil` and `OperatingMode == Running`, reconcile a controller-owned standard Kubernetes `resource.k8s.io/v1` `ResourceClaim` carrying JSON `NetworkParameters` in `OpaqueDeviceConfiguration`. Delete the claim on suspension or expiry to release consumable node capacity.
-   - Inject `ApplySandboxNetworkPodSpec` defaults (`enableServiceLinks: false`, `dnsPolicy: None` with `100.127.255.253`, single `sandbox-net-tun2connect` sidecar, isolated projected volumes for `PodCertificate`/`ServiceAccountToken(Pod)`, and `pod.Spec.ResourceClaims`).
+   - When `sandbox.Spec.Network != nil` and `OperatingMode == Running`, reconcile a controller-owned standard Kubernetes `resource.k8s.io/v1` `ResourceClaim` carrying JSON `NetworkParameters` in `OpaqueDeviceConfiguration`. Delete the claim on suspension or expiry to release the node DRA slot.
+   - Inject `ApplySandboxNetworkPodSpec` defaults (`enableServiceLinks: false`, `dnsPolicy: None` with `100.127.255.253` for `TunSidecar` or `127.0.0.1` for `ExplicitProxy`, single `sandbox-net-tun2connect` sidecar, isolated projected volumes for `PodCertificate`/`ServiceAccountToken(Pod)`, and `pod.Spec.ResourceClaims`).
    - Allow `PodNetworkIsolated` Sandboxes to become `Ready=True` and be adopted from `SandboxWarmPool` based on `NodeName` without requiring `PodIPs`.
    - Update `compareSandboxBlueprint` in `extensions/controllers/sandboxwarmpool_controller.go` to track `Network` drift.
    - Under `SandboxTemplate` with `NetworkPolicyDenyAll`, reconcile a strict empty-ingress/empty-egress deny-all `NetworkPolicy`. Under `PodNetworkIsolated`, skip/clean owned `NetworkPolicy`.
 3. **Node Plumbing DaemonSet (`packages/sandbox-net`):**
    - `pkg/params`: layered `DeviceClass` + `ResourceClaim` `OpaqueDeviceConfiguration` decoder with `custom` and arbitrary `opaque` JSON blocks.
    - `pkg/socketat`: goroutine-safe cross-netns execution and `ListenAt` / `ListenAtPath` following `github.com/aojea/socketat`.
-   - `pkg/catrust`: declarative Pod CA bundle resolver (`ConfigMap`, `ClusterTrustBundle`, `HostPath`), `AppendSystemRoots` / `Replace` materialization, and `agents.net` + multi-language CA env map.
+   - `pkg/catrust`: shared CA bundle resolver (`ConfigMap`, `Secret`, `ClusterTrustBundle`, `HostPath`) extracting strictly `CERTIFICATE` PEM blocks for both Pod `caTrust` (`AppendSystemRoots` / `Replace`) and `upstream.tls.caCertificateRefs`, plus the `agents.net` and multi-language CA env map.
    - `pkg/proxyenv`: full language magic proxy env var generator and non-clobbering container env merge (including `JAVA_TOOL_OPTIONS` append).
    - `pkg/auth`: all four native auth modes (`mtls.go`, `spiffe.go` using `github.com/spiffe/go-spiffe/v2` + streaming SPIRE Delegated Identity v1 client, `podcert.go` atomic KEP-4317 PEM bundle reader, `satoken.go` hot-reloading Node/Pod JWT reader).
-   - `pkg/tunnel`: per-Pod UDS + attached `socketat` loopback listener manager, strict RFC 9110/9112/9209/9298 parser and capsule stream, stdlib multiplexed HTTP/2 + HTTP/1.1 upstream dialer, immediate revocation, and structured `agents.net` JSONL audit logging.
+   - `pkg/tunnel`: per-Pod UDS + attached `socketat` loopback listener manager, strict RFC 9110/9112/9209/9298 parser (including plain HTTP `HTTP_PROXY` tunneling over upstream `CONNECT`), stdlib multiplexed HTTP/2 + HTTP/1.1 upstream dialer, immediate revocation, and structured `agents.net` JSONL audit logging.
    - `pkg/store`: schema-versioned BoltDB tmpfs checkpoint store.
-   - `pkg/driver`: DraNet-style DRA `kubeletplugin.DRAPlugin` + NRI plugin + node-scoped `core/v1` Pod informer for `ServiceAccount` and warm-pool claim sync.
+   - `pkg/driver`: DraNet-style standard GA DRA `kubeletplugin.DRAPlugin` (node pod-capacity slots, `MergePatch` `status.devices` via `resourceclaims/driver`) + NRI plugin + node-scoped `core/v1` Pod informer for `ServiceAccount` and warm-pool claim sync.
    - `pkg/metrics`: bounded-cardinality Prometheus counters/gauges/histograms.
+4. **End-to-End Verification (`test/e2e/sandbox_net_test.go`):**
+   - Multi-test `kind` E2E suite covering default & custom `ExplicitProxy` ports, `Secret`/`ConfigMap` `caTrust` (`AppendSystemRoots` and `Replace`, zero private-key leak), direct egress route-flush isolation, HTTPS + plain HTTP + direct UDS + `403` `Boundary-Reason`/`Proxy-Status`, `MTLS` (`kubernetes.io/tls` `Secret`), `ServiceAccountToken` (`Node` JWT), suspend/resume `ResourceClaim` release, `SandboxWarmPool` -> `SandboxClaim` identity sync, and `DeviceClass` opaque defaults/overrides.
 
 ## Scalability
 
 - **Zero extra CRDs and zero per-Pod policy watches:** Because configuration flows through standard Kubernetes DRA `ResourceClaim` allocations delivered by kubelet, `sandbox-net` requires no custom CRD informers. Its single watch is a node-scoped `core/v1` Pod informer (`fieldSelector: spec.nodeName=<node>`), scaling linearly with local Pod count only.
-- **Single `ResourceSlice` per node:** Using DRA consumable capacity (`allowMultipleAllocations: true`, `capacity.sandboxes: 1000`) produces exactly **one** `ResourceSlice` object per node instead of thousands of individual device entries.
+- **Single GA `ResourceSlice` for standard nodes:** Publishing per-pod slot devices sized to `node.Status.Allocatable.Pods()` (typically `110`, below `ResourceSliceMaxDevices = 128`) produces **one** `ResourceSlice` object per node (chunking cleanly for higher-density nodes) using 100% GA `resource.k8s.io/v1` with zero alpha/beta feature gates.
 - **Zero CDI disk I/O on the Pod start path:** NRI `CreateContainer` injects mounts, CA bundles, and `/dev/net/tun` in memory, avoiding per-Pod CDI JSON file creation and fsync overhead at high Pod churn.
 - **Multiplexed HTTP/2 upstream connections:** `MTLS`, `SPIFFE (Node)`, and `ServiceAccountToken` modes multiplex tunnels over persistent HTTP/2 TLS connections, keeping TLS handshake overhead negligible even under bursty agent tool calls.
-- **WarmPool compatibility:** Pre-warmed Sandboxes remain ready with zero cold start; on `SandboxClaim` adoption, the node-scoped Pod informer detects `agents.x-k8s.io/claim-uid` changes, refreshes attested headers, and revokes pre-claim tunnels immediately.
+- **WarmPool compatibility:** Pre-warmed Sandboxes remain ready with zero cold start; on `SandboxClaim` adoption, the node-scoped Pod informer detects `agents.x-k8s.io/sandbox-id` and `agents.x-k8s.io/sandbox-claim-name` updates, refreshes attested headers, and revokes pre-claim tunnels immediately.
 
 ## Alternatives
 
@@ -304,3 +313,7 @@ Almost no mainstream HTTP client (Go `net/http`, Python `requests`/`urllib3`/`ht
 ### Alternative 3: Hardcoding a single upstream authentication mechanism
 
 Choosing only mTLS or only ServiceAccount JWTs breaks real clusters: SPIRE environments expect SPIFFE X.509-SVIDs, Kubernetes 1.34+ clusters are adopting KEP-4317 `PodCertificateRequest`, `gke-labs/service-portals` uses node-attested `ServiceAccountToken` (`TokenReview`), and corporate proxies often use standard rotated mTLS certs. Supporting all four native Kubernetes auth modes behind a compact discriminated union covers every deployment environment cleanly.
+
+### Alternative 4: Requiring `DRAConsumableCapacity` (`allowMultipleAllocations: true`)
+
+An earlier revision modeled each node as a single shared device with `allowMultipleAllocations: true` and consumable `capacity.sandboxes`. Because `DRAConsumableCapacity` (and `DRADeviceTaints` / `DRAExtendedResource`) remain feature-gated while a node's Pod capacity (`node.Status.Allocatable.Pods()`, typically `110`) already bounds concurrent sandboxes and fits inside a single GA `ResourceSlice` (`<= 128` devices), publishing simple per-pod slot devices runs on every Kubernetes 1.34+ cluster out of the box with zero alpha/beta feature gates.

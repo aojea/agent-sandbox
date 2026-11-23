@@ -21,6 +21,7 @@ TOC is auto-generated via `make toc-update`.
     - [Declarative Pod CA Certificates (<code>agents.net</code> + Language Trust Env Vars)](#declarative-pod-ca-certificates-agentsnet--language-trust-env-vars)
     - [Upstream Authentication Modes](#upstream-authentication-modes)
     - [Standardized <code>agents.net</code> Upstream Wire &amp; Attested Metadata](#standardized-agentsnet-upstream-wire--attested-metadata)
+    - [Explicit Host-Side Ingress &amp; <code>sandbox-router</code> Integration](#explicit-host-side-ingress--sandbox-router-integration)
     - [API Changes](#api-changes)
     - [Implementation Guidance](#implementation-guidance)
 - [Scalability](#scalability)
@@ -202,6 +203,15 @@ When an upstream performs TLS inspection or uses private internal CAs, `spec.net
   - `Agents-Net-Claim-Uid`, `Agents-Net-Claim-Name` (updated live on `SandboxWarmPool` adoption)
   - `Agents-Net-Param-<name>` (sanitized custom key-value parameters from `spec.network.parameters` / DRA `Opaque` config)
 
+#### Explicit Host-Side Ingress & `sandbox-router` Integration
+
+Isolated sandboxes (`PodNetworkIsolated` with no Pod IP, or `NetworkPolicyDenyAll` with empty ingress rules) cannot receive direct Pod-IP traffic. When `spec.network.ingressPorts` declares allowed TCP ports, `sandbox-net` exposes a minimal node-local HTTP/1.1 `CONNECT <podUID>:<port>` ingress bridge (default `:15080`, optional TLS/mTLS via `--ingress-tls-cert`, `--ingress-tls-key`, and `--ingress-client-ca`):
+
+- **Strict port allowlist:** The bridge looks up `podUID` in the node's live store, rejects unknown Pods with `404 Not Found` (`Boundary-Reason: unknown-sandbox`), and rejects undeclared ports with `403 Forbidden` (`Boundary-Reason: ingress-port-denied`).
+- **Dual delivery without Pod IPs:** If the Pod adapter created `/run/agents.net/ingress.sock` (`TunSidecar`/`TunVM`), the bridge dials the Unix socket; otherwise (`ExplicitProxy`), it dials `127.0.0.1:<port>` inside the Pod's network namespace via `socketat.DialAtPath` (goroutine-safe `setns` with synchronous IP-literal `connect(2)`).
+- **Immediate revocation:** `StopPodSandbox`, `RemovePodSandbox`, `UnprepareResourceClaims`, and orphan `Synchronize` immediately revoke and close active ingress tunnels for the Pod.
+- **`sandbox-router` opt-in integration:** Setting `--sandbox-net-ingress-port=15080` (with `--cache-enabled=true` and optional `--sandbox-net-ingress-{ca,cert,key}-file`) enables `sandbox-router` to watch scheduled sandbox Pods with `spec.nodeName!=` (admitting Ready zero-PodIP `sandbox-net` Pods carrying `HostIP` and `PodUID`), isolate `http.Transport` and gRPC (`h2c`) connection pools per `<podUID>.sandbox-net.local:<port>`, and tunnel HTTP, WebSocket, and gRPC ingress over `CONNECT <podUID>:<port>` to `<HostIP>:15080`. Bridge `403`/`404` rejections surface directly to the caller without retrying or evicting the Pod cache.
+
 #### API Changes
 
 Zero new CRDs are introduced. One optional `network` field is added to `SandboxBlueprint` in `api/v1beta1`, making it available on both `Sandbox` and `SandboxTemplate`:
@@ -278,16 +288,20 @@ Validation rules (CEL `XValidation`):
    - Under `SandboxTemplate` with `NetworkPolicyDenyAll`, reconcile a strict empty-ingress/empty-egress deny-all `NetworkPolicy`. Under `PodNetworkIsolated`, skip/clean owned `NetworkPolicy`.
 3. **Node Plumbing DaemonSet (`packages/sandbox-net`):**
    - `pkg/params`: layered `DeviceClass` + `ResourceClaim` `OpaqueDeviceConfiguration` decoder with `custom` and arbitrary `opaque` JSON blocks.
-   - `pkg/socketat`: goroutine-safe cross-netns execution and `ListenAt` / `ListenAtPath` following `github.com/aojea/socketat`.
+   - `pkg/socketat`: goroutine-safe cross-netns execution, `ListenAt` / `ListenAtPath` (egress loopback listener), and `DialAt` / `DialAtPath` (ingress loopback dialing) following `github.com/aojea/socketat`.
    - `pkg/catrust`: shared CA bundle resolver (`ConfigMap`, `Secret`, `ClusterTrustBundle`, `HostPath`) extracting strictly `CERTIFICATE` PEM blocks for both Pod `caTrust` (`AppendSystemRoots` / `Replace`) and `upstream.tls.caCertificateRefs`, plus the `agents.net` and multi-language CA env map.
    - `pkg/proxyenv`: full language magic proxy env var generator and non-clobbering container env merge (including `JAVA_TOOL_OPTIONS` append).
-   - `pkg/auth`: all four native auth modes (`mtls.go`, `spiffe.go` using `github.com/spiffe/go-spiffe/v2` + streaming SPIRE Delegated Identity v1 client, `podcert.go` atomic KEP-4317 PEM bundle reader, `satoken.go` hot-reloading Node/Pod JWT reader).
-   - `pkg/tunnel`: per-Pod UDS + attached `socketat` loopback listener manager, strict RFC 9110/9112/9209/9298 parser (including plain HTTP `HTTP_PROXY` tunneling over upstream `CONNECT`), stdlib multiplexed HTTP/2 + HTTP/1.1 upstream dialer, immediate revocation, and structured `agents.net` JSONL audit logging.
+   - `pkg/auth`: all four native auth modes (`mtls.go` with live `cert-manager` Secret reload via `GetClientCertificate`, `spiffe.go` using `github.com/spiffe/go-spiffe/v2` + streaming SPIRE Delegated Identity v1 client, `podcert.go` atomic KEP-4317 PEM bundle reader, `satoken.go` hot-reloading Node/Pod JWT reader).
+   - `pkg/tunnel`: per-Pod UDS + attached `socketat` loopback listener manager, strict RFC 9110/9112/9209/9298 parser (including plain HTTP `HTTP_PROXY` tunneling over upstream `CONNECT`), stdlib multiplexed HTTP/2 + HTTP/1.1 upstream dialer, immediate revocation (canceling in-flight dials), and structured `agents.net` JSONL audit logging.
+   - `pkg/ingress`: node-local HTTP/1.1 `CONNECT <podUID>:<port>` host ingress bridge with optional TLS/mTLS, `spec.network.ingressPorts` enforcement (`403`/`404` + `Boundary-Reason`), `ingress.sock` or `socketat.DialAtPath` delivery, and per-Pod `Revoke`.
    - `pkg/store`: schema-versioned BoltDB tmpfs checkpoint store.
    - `pkg/driver`: DraNet-style standard GA DRA `kubeletplugin.DRAPlugin` (node pod-capacity slots, `MergePatch` `status.devices` via `resourceclaims/driver`) + NRI plugin + node-scoped `core/v1` Pod informer for `ServiceAccount` and warm-pool claim sync.
-   - `pkg/metrics`: bounded-cardinality Prometheus counters/gauges/histograms.
-4. **End-to-End Verification (`test/e2e/sandbox_net_test.go`):**
-   - Multi-test `kind` E2E suite covering default & custom `ExplicitProxy` ports, `Secret`/`ConfigMap` `caTrust` (`AppendSystemRoots` and `Replace`, zero private-key leak), direct egress route-flush isolation, HTTPS + plain HTTP + direct UDS + `403` `Boundary-Reason`/`Proxy-Status`, `MTLS` (`kubernetes.io/tls` `Secret`), `ServiceAccountToken` (`Node` JWT), suspend/resume `ResourceClaim` release, `SandboxWarmPool` -> `SandboxClaim` identity sync, and `DeviceClass` opaque defaults/overrides.
+   - `pkg/metrics`: bounded-cardinality Prometheus counters/gauges/histograms (`sandbox_net_tunnels_total`, `sandbox_net_ingress_connections_total`, active tunnels/sandboxes, dial latency).
+4. **`sandbox-router` Ingress Integration (`sandbox-router/`):**
+   - Add opt-in `--sandbox-net-ingress-port` (default `0`, disabled) and optional `--sandbox-net-ingress-{ca,cert,key}-file` flags.
+   - Admit Ready zero-PodIP `sandbox-net` Pods into `cache.Cache` when ingress bridge mode is enabled and isolate HTTP/gRPC connection pools per Pod UID via `<podUID>.sandbox-net.local:<port>`.
+5. **End-to-End Verification (`test/e2e/sandbox_net_test.go`, `test/e2e/images/sandbox-net-test-upstream/`):**
+   - 9-test `kind` E2E suite backed by a minimal stdlib Go upstream/destination fixture covering default & custom `ExplicitProxy` ports, `Secret`/`ConfigMap` `caTrust` (`AppendSystemRoots` and `Replace`, zero private-key leak), direct egress route-flush isolation, HTTPS + plain HTTP + direct UDS + `403` `Boundary-Reason`/`Proxy-Status`, `MTLS` (`kubernetes.io/tls` `Secret`), `ServiceAccountToken` (`Node` JWT), suspend/resume `ResourceClaim` release, `SandboxWarmPool` -> `SandboxClaim` identity sync, `DeviceClass` opaque defaults/overrides, `sandbox-router` -> `sandbox-net` host ingress (allow declared port, deny undeclared port `403`, revoke on suspend), default multiplexed `HTTP2` `CONNECT` + RFC 9298 `connect-udp` datagram relay, and Kubernetes `ClusterTrustBundle` + `caTrust.mode=MountOnly`.
 
 ## Scalability
 

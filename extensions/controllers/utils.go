@@ -16,6 +16,8 @@ package controllers
 
 import (
 	corev1 "k8s.io/api/core/v1"
+
+	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
 	sandboxcontrollers "sigs.k8s.io/agent-sandbox/controllers"
 	extensionsv1beta1 "sigs.k8s.io/agent-sandbox/extensions/api/v1beta1"
 )
@@ -28,6 +30,11 @@ func ApplySandboxSecureDefaults(template *extensionsv1beta1.SandboxTemplate, spe
 	if spec.AutomountServiceAccountToken == nil {
 		automount := false
 		spec.AutomountServiceAccountToken = &automount
+	}
+
+	if template.Spec.Network != nil {
+		sandboxcontrollers.ApplySandboxNetworkPodSpec(template.Spec.Network, spec, "")
+		return
 	}
 
 	// Determine if we are in "Secure By Default" mode
@@ -50,4 +57,17 @@ func ApplySandboxSecureDefaults(template *extensionsv1beta1.SandboxTemplate, spe
 // SandboxTemplateRefHash encapsulates the generation of the hash for a sandbox template ref.
 func SandboxTemplateRefHash(templateRefName string) string {
 	return sandboxcontrollers.NameHash(templateRefName)
+}
+
+// sandboxMissingNetworkPlacement reports whether a warm pool candidate is still waiting
+// for network or node placement before adoption. PodNetworkIsolated sandboxes never receive
+// PodIPs, so they require NodeName instead.
+func sandboxMissingNetworkPlacement(sb *sandboxv1beta1.Sandbox) bool {
+	if sb.Spec.Network != nil {
+		mode := sb.Spec.Network.ConfinementMode
+		if mode == "" || mode == sandboxv1beta1.SandboxConfinementModePodNetworkIsolated {
+			return sb.Status.NodeName == ""
+		}
+	}
+	return len(sb.Status.PodIPs) == 0
 }

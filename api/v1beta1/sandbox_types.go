@@ -346,6 +346,13 @@ type SandboxBlueprint struct {
 	// +kubebuilder:default=Retain
 	// +optional
 	FailedPodPolicy FailedPodPolicy `json:"failedPodPolicy,omitempty"`
+
+	// network configures agents.net isolated traffic plumbing via Kubernetes DRA and NRI.
+	// When set, the controller creates a ResourceClaim for the sandbox-net driver,
+	// wires Pod network isolation, and routes all egress to the configured upstream proxy.
+	// Policy enforcement and secret injection are delegated to that upstream.
+	// +optional
+	Network *SandboxNetworkSpec `json:"network,omitempty"`
 }
 
 // SandboxSpec defines the desired state of Sandbox.
@@ -461,6 +468,7 @@ type SandboxStatus struct {
 // +kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp"
 // +kubebuilder:storageversion
 // +kubebuilder:validation:XValidation:rule="!has(self.spec.service) || !self.spec.service || size(self.metadata.name) <= 63",message="metadata.name must not exceed 63 characters when spec.service is true"
+// +kubebuilder:validation:XValidation:rule="!has(self.spec.network) || (has(self.spec.network.confinementMode) && self.spec.network.confinementMode != 'PodNetworkIsolated') || !has(self.spec.service) || !self.spec.service",message="spec.service cannot be true when spec.network uses PodNetworkIsolated confinement"
 // Sandbox is the Schema for the sandboxes API.
 type Sandbox struct {
 	metav1.TypeMeta `json:",inline"`

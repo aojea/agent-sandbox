@@ -90,6 +90,14 @@ func (b *SandboxSpecApplyConfiguration) WithFailedPodPolicy(value apiv1beta1.Fai
 	return b
 }
 
+// WithNetwork sets the Network field in the declarative configuration to the given value
+// and returns the receiver, so that objects can be built by chaining "With" function invocations.
+// If called multiple times, the Network field is set to the value of the last call.
+func (b *SandboxSpecApplyConfiguration) WithNetwork(value *SandboxNetworkSpecApplyConfiguration) *SandboxSpecApplyConfiguration {
+	b.SandboxBlueprintApplyConfiguration.Network = value
+	return b
+}
+
 // WithShutdownTime sets the ShutdownTime field in the declarative configuration to the given value
 // and returns the receiver, so that objects can be built by chaining "With" function invocations.
 // If called multiple times, the ShutdownTime field is set to the value of the last call.

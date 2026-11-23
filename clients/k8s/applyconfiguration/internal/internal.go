@@ -2499,12 +2499,214 @@ var schemaYAML = typed.YAMLObject(`types:
       type:
         namedType: io.k8s.sigs.agent-sandbox.api.v1beta1.SandboxStatus
       default: {}
+- name: io.k8s.sigs.agent-sandbox.api.v1beta1.SandboxCASource
+  map:
+    fields:
+    - name: clusterTrustBundle
+      type:
+        namedType: io.k8s.sigs.agent-sandbox.api.v1beta1.SandboxClusterTrustBundleRef
+    - name: configMapRef
+      type:
+        namedType: io.k8s.sigs.agent-sandbox.api.v1beta1.SandboxConfigMapKeyRef
+    - name: hostPath
+      type:
+        scalar: string
+    - name: secretRef
+      type:
+        namedType: io.k8s.sigs.agent-sandbox.api.v1beta1.SandboxSecretKeyRef
+    - name: type
+      type:
+        scalar: string
+      default: ""
+- name: io.k8s.sigs.agent-sandbox.api.v1beta1.SandboxCATrustSpec
+  map:
+    fields:
+    - name: bundleMode
+      type:
+        scalar: string
+    - name: mode
+      type:
+        scalar: string
+    - name: sources
+      type:
+        list:
+          elementType:
+            namedType: io.k8s.sigs.agent-sandbox.api.v1beta1.SandboxCASource
+          elementRelationship: atomic
+- name: io.k8s.sigs.agent-sandbox.api.v1beta1.SandboxClusterTrustBundleRef
+  map:
+    fields:
+    - name: labelSelector
+      type:
+        namedType: LabelSelector.v1.meta.apis.pkg.apimachinery.k8s.io
+    - name: name
+      type:
+        scalar: string
+    - name: signerName
+      type:
+        scalar: string
+- name: io.k8s.sigs.agent-sandbox.api.v1beta1.SandboxConfigMapKeyRef
+  map:
+    fields:
+    - name: key
+      type:
+        scalar: string
+    - name: name
+      type:
+        scalar: string
+      default: ""
+- name: io.k8s.sigs.agent-sandbox.api.v1beta1.SandboxExplicitProxyConfig
+  map:
+    fields:
+    - name: noProxy
+      type:
+        list:
+          elementType:
+            scalar: string
+          elementRelationship: atomic
+    - name: port
+      type:
+        scalar: numeric
+- name: io.k8s.sigs.agent-sandbox.api.v1beta1.SandboxIngressPort
+  map:
+    fields:
+    - name: port
+      type:
+        scalar: numeric
+      default: 0
+    - name: protocol
+      type:
+        scalar: string
+- name: io.k8s.sigs.agent-sandbox.api.v1beta1.SandboxMTLSAuth
+  map:
+    fields:
+    - name: certDir
+      type:
+        scalar: string
+    - name: secretRef
+      type:
+        namedType: LocalObjectReference.v1.core.api.k8s.io
+- name: io.k8s.sigs.agent-sandbox.api.v1beta1.SandboxNetworkParameter
+  map:
+    fields:
+    - name: name
+      type:
+        scalar: string
+      default: ""
+    - name: value
+      type:
+        scalar: string
+      default: ""
+- name: io.k8s.sigs.agent-sandbox.api.v1beta1.SandboxNetworkSpec
+  map:
+    fields:
+    - name: adapterMode
+      type:
+        scalar: string
+    - name: caTrust
+      type:
+        namedType: io.k8s.sigs.agent-sandbox.api.v1beta1.SandboxCATrustSpec
+    - name: confinementMode
+      type:
+        scalar: string
+    - name: deviceClassName
+      type:
+        scalar: string
+    - name: ingressPorts
+      type:
+        list:
+          elementType:
+            namedType: io.k8s.sigs.agent-sandbox.api.v1beta1.SandboxIngressPort
+          elementRelationship: associative
+          keys:
+          - port
+    - name: parameters
+      type:
+        list:
+          elementType:
+            namedType: io.k8s.sigs.agent-sandbox.api.v1beta1.SandboxNetworkParameter
+          elementRelationship: associative
+          keys:
+          - name
+    - name: proxy
+      type:
+        namedType: io.k8s.sigs.agent-sandbox.api.v1beta1.SandboxExplicitProxyConfig
+    - name: upstream
+      type:
+        namedType: io.k8s.sigs.agent-sandbox.api.v1beta1.SandboxNetworkUpstream
+- name: io.k8s.sigs.agent-sandbox.api.v1beta1.SandboxNetworkUpstream
+  map:
+    fields:
+    - name: address
+      type:
+        scalar: string
+      default: ""
+    - name: auth
+      type:
+        namedType: io.k8s.sigs.agent-sandbox.api.v1beta1.SandboxUpstreamAuth
+    - name: protocol
+      type:
+        scalar: string
+    - name: tls
+      type:
+        namedType: io.k8s.sigs.agent-sandbox.api.v1beta1.SandboxUpstreamTLS
+- name: io.k8s.sigs.agent-sandbox.api.v1beta1.SandboxPodCertificateAuth
+  map:
+    fields:
+    - name: keyType
+      type:
+        scalar: string
+    - name: maxExpirationSeconds
+      type:
+        scalar: numeric
+    - name: signerName
+      type:
+        scalar: string
+      default: ""
+- name: io.k8s.sigs.agent-sandbox.api.v1beta1.SandboxSPIFFEAuth
+  map:
+    fields:
+    - name: delegatedSocketPath
+      type:
+        scalar: string
+    - name: mode
+      type:
+        scalar: string
+    - name: workloadSocketPath
+      type:
+        scalar: string
+- name: io.k8s.sigs.agent-sandbox.api.v1beta1.SandboxSecretKeyRef
+  map:
+    fields:
+    - name: key
+      type:
+        scalar: string
+    - name: name
+      type:
+        scalar: string
+      default: ""
+- name: io.k8s.sigs.agent-sandbox.api.v1beta1.SandboxServiceAccountTokenAuth
+  map:
+    fields:
+    - name: audience
+      type:
+        scalar: string
+      default: ""
+    - name: expirationSeconds
+      type:
+        scalar: numeric
+    - name: mode
+      type:
+        scalar: string
 - name: io.k8s.sigs.agent-sandbox.api.v1beta1.SandboxSpec
   map:
     fields:
     - name: failedPodPolicy
       type:
         scalar: string
+    - name: network
+      type:
+        namedType: io.k8s.sigs.agent-sandbox.api.v1beta1.SandboxNetworkSpec
     - name: operatingMode
       type:
         scalar: string
@@ -2552,6 +2754,46 @@ var schemaYAML = typed.YAMLObject(`types:
       type:
         scalar: string
     - name: serviceFQDN
+      type:
+        scalar: string
+- name: io.k8s.sigs.agent-sandbox.api.v1beta1.SandboxUpstreamAuth
+  map:
+    fields:
+    - name: mtls
+      type:
+        namedType: io.k8s.sigs.agent-sandbox.api.v1beta1.SandboxMTLSAuth
+    - name: podCertificate
+      type:
+        namedType: io.k8s.sigs.agent-sandbox.api.v1beta1.SandboxPodCertificateAuth
+    - name: serviceAccountToken
+      type:
+        namedType: io.k8s.sigs.agent-sandbox.api.v1beta1.SandboxServiceAccountTokenAuth
+    - name: spiffe
+      type:
+        namedType: io.k8s.sigs.agent-sandbox.api.v1beta1.SandboxSPIFFEAuth
+    - name: type
+      type:
+        scalar: string
+      default: ""
+- name: io.k8s.sigs.agent-sandbox.api.v1beta1.SandboxUpstreamTLS
+  map:
+    fields:
+    - name: acceptedSPIFFEIDs
+      type:
+        list:
+          elementType:
+            scalar: string
+          elementRelationship: atomic
+    - name: caCertificateRefs
+      type:
+        list:
+          elementType:
+            namedType: io.k8s.sigs.agent-sandbox.api.v1beta1.SandboxCASource
+          elementRelationship: atomic
+    - name: serverName
+      type:
+        scalar: string
+    - name: trustDomain
       type:
         scalar: string
 - name: __untyped_atomic_

@@ -26,6 +26,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	resourcev1 "k8s.io/api/resource/v1"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -379,6 +380,7 @@ type SandboxReconciler struct {
 //+kubebuilder:rbac:groups=core,resources=events,verbs=create;patch
 //+kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
 //+kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;list;watch;create;update;patch
+//+kubebuilder:rbac:groups=resource.k8s.io,resources=resourceclaims,verbs=get;list;watch;create;update;patch;delete
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
@@ -560,8 +562,17 @@ func (r *SandboxReconciler) reconcileChildResources(ctx context.Context, sandbox
 	// Reconcile PVCs from volumeClaimTemplates
 	recordChildErr(r.reconcilePVCs(ctx, sandbox, nameHash))
 
-	// Reconcile Pod
-	pod, recreateRequeue, podErr := r.reconcilePod(ctx, sandbox, nameHash, wd)
+	// Reconcile DRA network ResourceClaim when spec.network is configured.
+	_, networkClaimErr := r.reconcileNetworkResourceClaim(ctx, sandbox, nameHash)
+	recordChildErr(networkClaimErr)
+
+	// Reconcile Pod (skip creation while a required network ResourceClaim failed validation/creation).
+	var pod *corev1.Pod
+	var recreateRequeue time.Duration
+	var podErr error
+	if networkClaimErr == nil {
+		pod, recreateRequeue, podErr = r.reconcilePod(ctx, sandbox, nameHash, wd)
+	}
 	podMappingConflict := isMultipleSandboxPodsError(podErr)
 	if podMappingConflict {
 		conditionErrors = errors.Join(conditionErrors, podErr)
@@ -805,7 +816,14 @@ func (r *SandboxReconciler) computeReadyCondition(sandbox *sandboxv1beta1.Sandbo
 			for _, condition := range pod.Status.Conditions {
 				if condition.Type == corev1.PodReady {
 					if condition.Status == corev1.ConditionTrue {
-						if len(pod.Status.PodIPs) == 0 {
+						if sandboxIsPodNetworkIsolated(sandbox) {
+							if pod.Spec.NodeName == "" {
+								message = "Pod is Ready but has no nodeName yet"
+							} else {
+								message = "Pod is Ready"
+								podReady = true
+							}
+						} else if len(pod.Status.PodIPs) == 0 {
 							message = "Pod is Ready but has no podIPs yet"
 						} else {
 							message = "Pod is Ready"
@@ -2052,6 +2070,9 @@ func (r *SandboxReconciler) reconcilePod(ctx context.Context, sandbox *sandboxv1
 	}
 
 	mutatedSpec := sandbox.Spec.PodTemplate.Spec.DeepCopy()
+	if sandbox.Spec.Network != nil {
+		ApplySandboxNetworkPodSpec(sandbox.Spec.Network, mutatedSpec, networkResourceClaimName(sandbox.Name))
+	}
 
 	// Build PVC volumes from volumeClaimTemplates
 	var pvcVolumes []corev1.Volume
@@ -2393,6 +2414,10 @@ func (r *SandboxReconciler) handleSandboxExpiry(ctx context.Context, sandbox *sa
 		}
 	}
 
+	if err := r.deleteNetworkResourceClaim(ctx, sandbox); err != nil {
+		allErrors = errors.Join(allErrors, err)
+	}
+
 	if sandbox.Spec.ShutdownPolicy != nil && *sandbox.Spec.ShutdownPolicy == sandboxv1beta1.ShutdownPolicyDelete {
 		if err := r.Delete(ctx, sandbox); err != nil && !k8serrors.IsNotFound(err) {
 			allErrors = errors.Join(allErrors, fmt.Errorf("failed to delete sandbox: %w", err))
@@ -2491,10 +2516,16 @@ func (r *SandboxReconciler) SetupWithManager(mgr ctrl.Manager, concurrentWorkers
 		return err
 	}
 
-	return ctrl.NewControllerManagedBy(mgr).
+	b := ctrl.NewControllerManagedBy(mgr).
 		For(&sandboxv1beta1.Sandbox{}, builder.WithPredicates(r.sandboxCreationMetricsPredicate())).
 		Owns(&corev1.Pod{}, builder.WithPredicates(labelSelectorPredicate)).
-		Owns(&corev1.Service{}, builder.WithPredicates(labelSelectorPredicate)).
+		Owns(&corev1.Service{}, builder.WithPredicates(labelSelectorPredicate))
+	if mapper := mgr.GetRESTMapper(); mapper != nil {
+		if _, err := mapper.RESTMapping(resourcev1.SchemeGroupVersion.WithKind("ResourceClaim").GroupKind(), resourcev1.SchemeGroupVersion.Version); err == nil {
+			b = b.Owns(&resourcev1.ResourceClaim{}, builder.WithPredicates(labelSelectorPredicate))
+		}
+	}
+	return b.
 		WithOptions(controller.Options{MaxConcurrentReconciles: concurrentWorkers}).
 		Complete(r)
 }

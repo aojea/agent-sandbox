@@ -162,6 +162,8 @@ type SandboxTemplateSpec struct {
 // +kubebuilder:object:root=true
 // +kubebuilder:resource:scope=Namespaced,shortName=sandboxtemplate
 // +kubebuilder:storageversion
+// +kubebuilder:validation:XValidation:rule="!has(self.spec.network) || !has(self.spec.networkPolicy)",message="spec.networkPolicy cannot be set when spec.network is configured"
+// +kubebuilder:validation:XValidation:rule="!has(self.spec.network) || (has(self.spec.network.confinementMode) && self.spec.network.confinementMode != 'PodNetworkIsolated') || !has(self.spec.service) || !self.spec.service",message="spec.service cannot be true when spec.network uses PodNetworkIsolated confinement"
 // SandboxTemplate is the Schema for the sandbox template API.
 type SandboxTemplate struct {
 	metav1.TypeMeta `json:",inline"`

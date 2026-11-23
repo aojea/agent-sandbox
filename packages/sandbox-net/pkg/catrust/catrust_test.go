@@ -1,0 +1,184 @@
+// Copyright 2026 The Kubernetes Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package catrust
+
+import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
+	"math/big"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	certificatesv1beta1 "k8s.io/api/certificates/v1beta1"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	k8sfake "k8s.io/client-go/kubernetes/fake"
+
+	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
+)
+
+func makeSelfSignedCAPEM(t *testing.T, cn string) []byte {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("gen key: %v", err)
+	}
+	serial, _ := rand.Int(rand.Reader, big.NewInt(1<<60))
+	tmpl := &x509.Certificate{
+		SerialNumber:          serial,
+		Subject:               pkix.Name{CommonName: cn},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(24 * time.Hour),
+		KeyUsage:              x509.KeyUsageCertSign,
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatalf("create cert: %v", err)
+	}
+	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+}
+
+func TestMaterializeAllSourcesAppendAndReplace(t *testing.T) {
+	ctx := t.Context()
+	sysCA := makeSelfSignedCAPEM(t, "system-root-ca")
+	cmCA := makeSelfSignedCAPEM(t, "configmap-ca")
+	secCA := makeSelfSignedCAPEM(t, "cert-manager-secret-ca")
+	ctbCA := makeSelfSignedCAPEM(t, "ctb-ca")
+	hostCA := makeSelfSignedCAPEM(t, "host-ca")
+
+	// Simulate a cert-manager kubernetes.io/tls Secret where ca.crt has a stray PRIVATE KEY
+	// block alongside the CA cert: Materialize MUST extract only the CERTIFICATE block.
+	secretDataWithKey := append([]byte("-----BEGIN PRIVATE KEY-----\nZmFrZS1rZXk=\n-----END PRIVATE KEY-----\n"), secCA...)
+
+	tmp := t.TempDir()
+	sysPath := filepath.Join(tmp, "sys-roots.pem")
+	hostPath := filepath.Join(tmp, "host-ca.pem")
+	_ = os.WriteFile(sysPath, sysCA, 0o600)
+	_ = os.WriteFile(hostPath, hostCA, 0o600)
+
+	fakeKube := k8sfake.NewClientset(
+		&corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{Name: "corp-ca", Namespace: "agents"},
+			Data:       map[string]string{"ca.crt": string(cmCA)},
+		},
+		&corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: "certmgr-ca", Namespace: "agents"},
+			Type:       corev1.SecretTypeTLS,
+			Data: map[string][]byte{
+				"ca.crt":  secretDataWithKey,
+				"tls.key": []byte("-----BEGIN PRIVATE KEY-----\nU0VDUkVU\n-----END PRIVATE KEY-----\n"),
+			},
+		},
+		&certificatesv1beta1.ClusterTrustBundle{
+			ObjectMeta: metav1.ObjectMeta{Name: "egress-ctb", Labels: map[string]string{"env": "prod"}},
+			Spec: certificatesv1beta1.ClusterTrustBundleSpec{
+				SignerName:  "example.com/egress-ca",
+				TrustBundle: string(ctbCA),
+			},
+		},
+	)
+
+	mat := NewMaterializer(fakeKube, sysPath)
+	spec := &sandboxv1beta1.SandboxCATrustSpec{
+		Mode:       sandboxv1beta1.SandboxCATrustModeInjectEnv,
+		BundleMode: sandboxv1beta1.SandboxCABundleModeAppendSystemRoots,
+		Sources: []sandboxv1beta1.SandboxCASource{
+			{
+				Type:         sandboxv1beta1.SandboxCASourceTypeConfigMap,
+				ConfigMapRef: &sandboxv1beta1.SandboxConfigMapKeyRef{Name: "corp-ca"},
+			},
+			{
+				Type:      sandboxv1beta1.SandboxCASourceTypeSecret,
+				SecretRef: &sandboxv1beta1.SandboxSecretKeyRef{Name: "certmgr-ca"},
+			},
+			{
+				Type: sandboxv1beta1.SandboxCASourceTypeClusterTrustBundle,
+				ClusterTrustBundle: &sandboxv1beta1.SandboxClusterTrustBundleRef{
+					SignerName:    "example.com/egress-ca",
+					LabelSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"env": "prod"}},
+				},
+			},
+			{
+				Type:     sandboxv1beta1.SandboxCASourceTypeHostPath,
+				HostPath: hostPath,
+			},
+		},
+	}
+
+	outDir := filepath.Join(tmp, "out-append")
+	bundle, err := mat.Materialize(ctx, spec, "agents", outDir)
+	if err != nil {
+		t.Fatalf("Materialize AppendSystemRoots: %v", err)
+	}
+
+	merged, err := os.ReadFile(bundle.MergedHostPath)
+	if err != nil {
+		t.Fatalf("read merged: %v", err)
+	}
+	extra, err := os.ReadFile(bundle.ExtraHostPath)
+	if err != nil {
+		t.Fatalf("read extra: %v", err)
+	}
+
+	// Never leak PRIVATE KEY blocks from Secret sources into mounted CA bundles.
+	if strings.Contains(string(merged), "PRIVATE KEY") || strings.Contains(string(extra), "PRIVATE KEY") {
+		t.Fatalf("private key leaked into materialized CA bundle")
+	}
+
+	// Merged bundle has system root + 4 custom CAs = 5 certs.
+	if got := strings.Count(string(merged), "BEGIN CERTIFICATE"); got != 5 {
+		t.Fatalf("merged cert count = %d, want 5", got)
+	}
+	// Extra bundle (for NODE_EXTRA_CA_CERTS) has only the 4 custom CAs.
+	if got := strings.Count(string(extra), "BEGIN CERTIFICATE"); got != 4 {
+		t.Fatalf("extra cert count = %d, want 4", got)
+	}
+
+	// Replace mode must NOT include system root CA.
+	spec.BundleMode = sandboxv1beta1.SandboxCABundleModeReplace
+	bundleRep, err := mat.Materialize(ctx, spec, "agents", filepath.Join(tmp, "out-replace"))
+	if err != nil {
+		t.Fatalf("Materialize Replace: %v", err)
+	}
+	repBytes, _ := os.ReadFile(bundleRep.MergedHostPath)
+	if got := strings.Count(string(repBytes), "BEGIN CERTIFICATE"); got != 4 {
+		t.Fatalf("replace cert count = %d, want 4", got)
+	}
+
+	// Verify env var mapping covers agents.net + all major runtimes.
+	envs := EnvVars("", "")
+	for _, key := range []string{
+		"AGENT_CA_CERT", "AGENTS_NET_CA_BUNDLE", "SSL_CERT_FILE",
+		"REQUESTS_CA_BUNDLE", "PIP_CERT", "CURL_CA_BUNDLE", "GIT_SSL_CAINFO",
+		"NODE_EXTRA_CA_CERTS", "NPM_CONFIG_CAFILE", "DENO_CERT",
+		"CARGO_HTTP_CAINFO", "AWS_CA_BUNDLE", "CLOUDSDK_CORE_CUSTOM_CA_CERTS_FILE",
+	} {
+		if envs[key] == "" {
+			t.Fatalf("missing CA env var %q", key)
+		}
+	}
+	if envs["NODE_EXTRA_CA_CERTS"] != ContainerExtraCAPath {
+		t.Fatalf("NODE_EXTRA_CA_CERTS = %q, want %q", envs["NODE_EXTRA_CA_CERTS"], ContainerExtraCAPath)
+	}
+}

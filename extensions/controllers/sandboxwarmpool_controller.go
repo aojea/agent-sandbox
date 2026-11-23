@@ -1371,7 +1371,33 @@ func compareSandboxBlueprint(template *extensionsv1beta1.SandboxTemplate, actual
 		compareVolumeClaimTemplates(template, actualSandboxSpec.VolumeClaimTemplates) &&
 		equality.Semantic.DeepEqual(template.Spec.Service, actualSandboxSpec.Service) &&
 		normalizeFailedPodPolicy(template.Spec.FailedPodPolicy) ==
-			normalizeFailedPodPolicy(actualSandboxSpec.FailedPodPolicy)
+			normalizeFailedPodPolicy(actualSandboxSpec.FailedPodPolicy) &&
+		equality.Semantic.DeepEqual(normalizeSandboxNetwork(template.Spec.Network), normalizeSandboxNetwork(actualSandboxSpec.Network))
+}
+
+func normalizeSandboxNetwork(net *sandboxv1beta1.SandboxNetworkSpec) *sandboxv1beta1.SandboxNetworkSpec {
+	if net == nil {
+		return nil
+	}
+	out := net.DeepCopy()
+	if out.DeviceClassName == "" {
+		out.DeviceClassName = sandboxv1beta1.DefaultSandboxNetDeviceClassName
+	}
+	if out.ConfinementMode == "" {
+		out.ConfinementMode = sandboxv1beta1.SandboxConfinementModePodNetworkIsolated
+	}
+	if out.AdapterMode == "" {
+		out.AdapterMode = sandboxv1beta1.SandboxAdapterModeTunSidecar
+	}
+	if out.CATrust != nil {
+		if out.CATrust.Mode == "" {
+			out.CATrust.Mode = sandboxv1beta1.SandboxCATrustModeInjectEnv
+		}
+		if out.CATrust.BundleMode == "" {
+			out.CATrust.BundleMode = sandboxv1beta1.SandboxCABundleModeAppendSystemRoots
+		}
+	}
+	return out
 }
 
 func normalizeFailedPodPolicy(policy sandboxv1beta1.FailedPodPolicy) sandboxv1beta1.FailedPodPolicy {

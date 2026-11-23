@@ -290,10 +290,15 @@ def discover_images(args, excluded_dirs):
                 context_dir = "."
                 service_name = "sandbox-router-go"
 
-            # sandboxd (the portable runtime daemon) also imports the shared
-            # Go module, so it too builds from the repo root.
+            # sandboxd (the portable runtime daemon) and sandbox-net (the per-node
+            # DRA+NRI agents.net plumbing DaemonSet) import the shared Go module,
+            # so they build from the repo root.
             sandboxd_dir = os.path.join(".", "packages", "sandboxd")
             if root == sandboxd_dir:
+                context_dir = "."
+
+            sandbox_net_dir = os.path.join(".", "packages", "sandbox-net")
+            if root == sandbox_net_dir:
                 context_dir = "."
 
             # The geminicli-toolbox image also imports the shared Go module,

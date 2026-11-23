@@ -1,0 +1,35 @@
+# Copyright 2026 The Kubernetes Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# DraNet-style standard GA Kubernetes DRA DeviceClass for sandbox-net agents.net plumbing.
+# Works with plain GA resource.k8s.io/v1 (no alpha/beta DRA feature gates required).
+# Cluster administrators may configure default upstream, CA trust, and auth
+# parameters in spec.config[].opaque.parameters; individual Sandboxes or
+# ResourceClaims can override or extend them with custom metadata.
+apiVersion: resource.k8s.io/v1
+kind: DeviceClass
+metadata:
+  name: sandbox-net.agents.x-k8s.io
+spec:
+  selectors:
+    - cel:
+        expression: device.driver == "sandbox-net.agents.x-k8s.io"
+  config:
+    - opaque:
+        driver: sandbox-net.agents.x-k8s.io
+        parameters:
+          confinementMode: PodNetworkIsolated
+          adapterMode: TunSidecar
+          maxConnections: 1024
+          idleTimeoutSeconds: 300

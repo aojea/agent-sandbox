@@ -35,6 +35,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -610,6 +611,155 @@ func TestTunnelExplicitHTTPProxyViaConnect(t *testing.T) {
 	if sbHdr != "http-sb" {
 		t.Fatalf("upstream %s = %q, want http-sb", auth.HeaderSandboxName, sbHdr)
 	}
+}
+
+func TestTunnelHTTP2Multiplexing(t *testing.T) {
+	ctx := t.Context()
+	caPEM, srvCertPEM, srvKeyPEM, _, _, _ := generateTestCerts(t)
+	serverPair, err := tls.X509KeyPair(srvCertPEM, srvKeyPEM)
+	if err != nil {
+		t.Fatalf("load server keypair: %v", err)
+	}
+
+	// Two distinct backend servers to verify HTTP/2 multiplexes distinct destinations
+	// over a single upstream TLS connection.
+	dest1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, "dest-one")
+	}))
+	defer dest1.Close()
+	dest2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, "dest-two")
+	}))
+	defer dest2.Close()
+
+	var connCount atomic.Int32
+	baseLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	tlsLn := tls.NewListener(baseLn, &tls.Config{
+		MinVersion:   tls.VersionTLS12,
+		Certificates: []tls.Certificate{serverPair},
+		NextProtos:   []string{"h2"},
+	})
+	countingLn := &countingListener{Listener: tlsLn, count: &connCount}
+
+	protos := new(http.Protocols)
+	protos.SetHTTP2(true)
+	h2Srv := &http.Server{
+		Protocols: protos,
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodConnect {
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			dst, err := net.DialTimeout("tcp", r.Host, 2*time.Second)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadGateway)
+				return
+			}
+			defer func() { _ = dst.Close() }()
+			w.WriteHeader(http.StatusOK)
+			rc := http.NewResponseController(w)
+			_ = rc.Flush()
+			go func() {
+				_, _ = io.Copy(dst, r.Body)
+				if tc, ok := dst.(*net.TCPConn); ok {
+					_ = tc.CloseWrite()
+				}
+			}()
+			buf := make([]byte, 4096)
+			for {
+				n, rerr := dst.Read(buf)
+				if n > 0 {
+					if _, werr := w.Write(buf[:n]); werr != nil {
+						return
+					}
+					_ = rc.Flush()
+				}
+				if rerr != nil {
+					return
+				}
+			}
+		}),
+	}
+	go func() { _ = h2Srv.Serve(countingLn) }()
+	defer func() { _ = h2Srv.Close() }()
+
+	caPath := filepath.Join(t.TempDir(), "ca.crt")
+	_ = os.WriteFile(caPath, caPEM, 0o600)
+
+	mgr, err := NewManager(t.TempDir(), nil, WithAuditWriter(io.Discard))
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	defer mgr.Close()
+
+	podUID := types.UID("pod-h2-mux")
+	if _, err := mgr.EnsureListener(ctx, podUID, ListenerConfig{
+		Identity: auth.WorkloadIdentity{Namespace: "agents", SandboxName: "h2-sb", PodUID: podUID},
+		Upstream: &sandboxv1beta1.SandboxNetworkUpstream{
+			Address:  "https://" + baseLn.Addr().String(),
+			Protocol: sandboxv1beta1.SandboxUpstreamProtocolHTTP2,
+			TLS: &sandboxv1beta1.SandboxUpstreamTLS{
+				ServerName: "upstream.local",
+				CACertificateRefs: []sandboxv1beta1.SandboxCASource{
+					{Type: sandboxv1beta1.SandboxCASourceTypeHostPath, HostPath: caPath},
+				},
+			},
+		},
+	}); err != nil {
+		t.Fatalf("EnsureListener: %v", err)
+	}
+
+	loopLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen loopback: %v", err)
+	}
+	if err := mgr.AttachListener(podUID, loopLn); err != nil {
+		t.Fatalf("AttachListener: %v", err)
+	}
+
+	proxyURL, _ := url.Parse("http://" + loopLn.Addr().String())
+	httpCli := &http.Client{
+		Transport: &http.Transport{Proxy: http.ProxyURL(proxyURL)},
+		Timeout:   5 * time.Second,
+	}
+
+	for _, tc := range []struct {
+		url  string
+		want string
+	}{
+		{dest1.URL, "dest-one"},
+		{dest2.URL, "dest-two"},
+	} {
+		resp, err := httpCli.Get(tc.url)
+		if err != nil {
+			t.Fatalf("GET %s via H2 CONNECT: %v", tc.url, err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusOK || string(body) != tc.want {
+			t.Fatalf("GET %s: status=%d body=%q, want 200 %q", tc.url, resp.StatusCode, string(body), tc.want)
+		}
+	}
+
+	if got := connCount.Load(); got != 1 {
+		t.Fatalf("expected 1 multiplexed HTTP/2 TLS connection for 2 distinct destinations, got %d", got)
+	}
+}
+
+type countingListener struct {
+	net.Listener
+	count *atomic.Int32
+}
+
+func (l *countingListener) Accept() (net.Conn, error) {
+	c, err := l.Listener.Accept()
+	if err == nil {
+		l.count.Add(1)
+	}
+	return c, err
 }
 
 func sendRawRequest(t *testing.T, sockPath, raw string) string {

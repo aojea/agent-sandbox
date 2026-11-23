@@ -19,6 +19,7 @@ package socketat
 import (
 	"errors"
 	"net"
+	"time"
 )
 
 var errUnsupportedOS = errors.New("socketat network namespace operations require Linux")
@@ -30,6 +31,16 @@ func ListenAtPath(_, _, _ string) (net.Listener, error) {
 
 // ListenAt returns an error on non-Linux platforms.
 func ListenAt(_ int, _, _ string) (net.Listener, error) {
+	return nil, errUnsupportedOS
+}
+
+// DialAtPath returns an error on non-Linux platforms.
+func DialAtPath(_, _, _ string, _ time.Duration) (net.Conn, error) {
+	return nil, errUnsupportedOS
+}
+
+// DialAt returns an error on non-Linux platforms.
+func DialAt(_ int, _, _ string, _ time.Duration) (net.Conn, error) {
 	return nil, errUnsupportedOS
 }
 

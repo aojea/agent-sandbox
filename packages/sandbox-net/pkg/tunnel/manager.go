@@ -240,22 +240,26 @@ func (m *Manager) EnsureListener(ctx context.Context, podUID types.UID, cfg List
 		return store.SocketPaths{}, fmt.Errorf("chmod %q: %w", paths.EgressSocketPath, err)
 	}
 
+	revokeCtx, revokeCancel := context.WithCancel(context.Background())
 	sl := &sandboxListener{
-		manager:     m,
-		podUID:      podUID,
-		paths:       paths,
-		ln:          ln,
-		dialer:      dialer,
-		authMode:    authMode,
-		maxConns:    cfg.MaxConnections,
-		idleTimeout: time.Duration(cfg.IdleTimeoutSeconds) * time.Second,
-		identity:    cfg.Identity,
-		active:      make(map[net.Conn]func()),
+		manager:      m,
+		podUID:       podUID,
+		paths:        paths,
+		ln:           ln,
+		dialer:       dialer,
+		authMode:     authMode,
+		maxConns:     cfg.MaxConnections,
+		idleTimeout:  time.Duration(cfg.IdleTimeoutSeconds) * time.Second,
+		revokeCtx:    revokeCtx,
+		revokeCancel: revokeCancel,
+		identity:     cfg.Identity,
+		active:       make(map[net.Conn]func()),
 	}
 
 	m.mu.Lock()
 	if existing, ok := m.listeners[podUID]; ok {
 		m.mu.Unlock()
+		revokeCancel()
 		_ = ln.Close()
 		if dialer != nil {
 			_ = dialer.Close()
@@ -373,14 +377,16 @@ func probeUnixSocket(path string, timeout time.Duration) error {
 }
 
 type sandboxListener struct {
-	manager     *Manager
-	podUID      types.UID
-	paths       store.SocketPaths
-	ln          net.Listener
-	dialer      *upstreamDialer
-	authMode    string
-	maxConns    int
-	idleTimeout time.Duration
+	manager      *Manager
+	podUID       types.UID
+	paths        store.SocketPaths
+	ln           net.Listener
+	dialer       *upstreamDialer
+	authMode     string
+	maxConns     int
+	idleTimeout  time.Duration
+	revokeCtx    context.Context
+	revokeCancel context.CancelFunc
 
 	mu             sync.RWMutex
 	identity       auth.WorkloadIdentity
@@ -424,6 +430,7 @@ func (l *sandboxListener) updateIdentity(id auth.WorkloadIdentity, revokeActive 
 }
 
 func (l *sandboxListener) revoke() {
+	l.revokeCancel()
 	l.mu.Lock()
 	l.revoked = true
 	closers := make([]func(), 0, len(l.active))
@@ -495,12 +502,17 @@ func (l *sandboxListener) acceptLoop(ln net.Listener) {
 	}
 }
 
-func (l *sandboxListener) setConnCloser(conn net.Conn, fn func()) {
+func (l *sandboxListener) setConnCloser(conn net.Conn, fn func()) bool {
 	l.mu.Lock()
+	if l.revoked {
+		l.mu.Unlock()
+		return false
+	}
 	if _, ok := l.active[conn]; ok {
 		l.active[conn] = fn
 	}
 	l.mu.Unlock()
+	return true
 }
 
 func (l *sandboxListener) snapshotIdentity() auth.WorkloadIdentity {
@@ -552,7 +564,7 @@ func (l *sandboxListener) serveConn(conn net.Conn) {
 		return
 	}
 
-	dialCtx, cancel := context.WithTimeout(context.Background(), l.manager.dialTimeout)
+	dialCtx, cancel := context.WithTimeout(l.revokeCtx, l.manager.dialTimeout)
 	defer cancel()
 
 	id := l.snapshotIdentity()
@@ -608,7 +620,9 @@ func (l *sandboxListener) serveConn(conn net.Conn) {
 		return
 	}
 	defer up.close()
-	l.setConnCloser(conn, up.close)
+	if !l.setConnCloser(conn, up.close) {
+		return
+	}
 
 	_ = conn.SetWriteDeadline(time.Now().Add(l.manager.headTimeout))
 	switch {

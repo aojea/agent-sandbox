@@ -677,6 +677,56 @@ func TestValidate(t *testing.T) {
 			},
 			wantErr: "",
 		},
+		{
+			name: "sandbox-net ingress port valid with cache enabled",
+			mut: func(c *Config) {
+				c.CacheEnabled = true
+				c.SandboxNetIngressPort = 15080
+			},
+			wantErr: "",
+		},
+		{
+			name: "sandbox-net ingress port with mTLS valid",
+			mut: func(c *Config) {
+				c.CacheEnabled = true
+				c.SandboxNetIngressPort = 15080
+				c.SandboxNetIngressCAFile = "/etc/tls/ca.crt"
+				c.SandboxNetIngressCertFile = "/etc/tls/tls.crt"
+				c.SandboxNetIngressKeyFile = "/etc/tls/tls.key"
+			},
+			wantErr: "",
+		},
+		{
+			name: "sandbox-net ingress port requires cache enabled",
+			mut: func(c *Config) {
+				c.SandboxNetIngressPort = 15080
+			},
+			wantErr: "--sandbox-net-ingress-port requires --cache-enabled",
+		},
+		{
+			name: "sandbox-net ingress port out of range",
+			mut: func(c *Config) {
+				c.CacheEnabled = true
+				c.SandboxNetIngressPort = 70000
+			},
+			wantErr: "--sandbox-net-ingress-port must be between 0 and 65535",
+		},
+		{
+			name: "sandbox-net ingress cert without key rejected",
+			mut: func(c *Config) {
+				c.CacheEnabled = true
+				c.SandboxNetIngressPort = 15080
+				c.SandboxNetIngressCertFile = "/etc/tls/tls.crt"
+			},
+			wantErr: "--sandbox-net-ingress-cert-file and --sandbox-net-ingress-key-file must be set together",
+		},
+		{
+			name: "sandbox-net ingress CA without port rejected",
+			mut: func(c *Config) {
+				c.SandboxNetIngressCAFile = "/etc/tls/ca.crt"
+			},
+			wantErr: "require --sandbox-net-ingress-port > 0",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

@@ -485,7 +485,7 @@ func (u *upstreamDialer) dialH2Connect(ctx context.Context, authority string, hd
 
 	req := (&http.Request{
 		Method: http.MethodConnect,
-		URL:    &url.URL{Scheme: "https", Host: authority},
+		URL:    &url.URL{Scheme: "https", Host: u.target.address},
 		Host:   authority,
 		Header: hdrs,
 		Body:   pr,
@@ -498,6 +498,9 @@ func (u *upstreamDialer) dialH2Connect(ctx context.Context, authority string, hd
 	resCh := make(chan roundTripRes, 1)
 	go func() {
 		resp, err := u.getH2Transport().RoundTrip(req)
+		if reqCtx.Err() != nil && resp != nil && resp.Body != nil {
+			_ = resp.Body.Close()
+		}
 		resCh <- roundTripRes{resp: resp, err: err}
 	}()
 

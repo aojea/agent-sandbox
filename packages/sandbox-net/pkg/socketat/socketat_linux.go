@@ -24,6 +24,7 @@ import (
 	"net"
 	"os"
 	"runtime"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -52,6 +53,42 @@ func ListenAt(nsFD int, network, address string) (net.Listener, error) {
 		return nil, err
 	}
 	return ln, nil
+}
+
+// DialAtPath opens netnsPath and dials address inside that network namespace.
+// Address must use a literal IP (such as 127.0.0.1:<port>) so Dial executes
+// synchronously on the locked OS thread without spawning a DNS goroutine.
+func DialAtPath(netnsPath, network, address string, timeout time.Duration) (net.Conn, error) {
+	f, err := os.Open(netnsPath)
+	if err != nil {
+		return nil, fmt.Errorf("open network namespace %q: %w", netnsPath, err)
+	}
+	defer func() { _ = f.Close() }()
+	return DialAt(int(f.Fd()), network, address, timeout)
+}
+
+// DialAt dials a literal IP:port inside the network namespace referenced by nsFD.
+// The returned net.Conn stays bound to the target namespace while I/O runs on
+// ordinary host goroutines.
+func DialAt(nsFD int, network, address string, timeout time.Duration) (net.Conn, error) {
+	host, _, err := net.SplitHostPort(address)
+	if err != nil || net.ParseIP(host) == nil {
+		return nil, fmt.Errorf("socketat.DialAt requires literal IP:port, got %q", address)
+	}
+	var conn net.Conn
+	err = DoAtNS(nsFD, func() error {
+		d := net.Dialer{
+			Timeout:       timeout,
+			FallbackDelay: -1,
+		}
+		var derr error
+		conn, derr = d.Dial(network, address)
+		return derr
+	})
+	if err != nil {
+		return nil, err
+	}
+	return conn, nil
 }
 
 // DoAtNSPath opens netnsPath and executes fn synchronously on a locked OS thread

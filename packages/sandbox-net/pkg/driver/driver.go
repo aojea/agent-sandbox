@@ -83,6 +83,11 @@ type NetNSManager interface {
 	ListenAt(netnsPath, network, address string) (net.Listener, error)
 }
 
+// IngressRevoker revokes active host ingress connections when a Pod stops or is removed.
+type IngressRevoker interface {
+	Revoke(podUID types.UID)
+}
+
 // Config configures the per-node SandboxNetDriver.
 type Config struct {
 	DriverName        string
@@ -90,6 +95,7 @@ type Config struct {
 	KubeClient        kubernetes.Interface
 	Store             *store.PodConfigStore
 	Tunnel            *tunnel.Manager
+	Ingress           IngressRevoker
 	CAMaterializer    *catrust.Materializer
 	NetNS             NetNSManager
 	MaxSandboxes      int64
@@ -108,6 +114,7 @@ type SandboxNetDriver struct {
 	kubeClient     kubernetes.Interface
 	store          *store.PodConfigStore
 	tunnel         *tunnel.Manager
+	ingress        IngressRevoker
 	caMat          *catrust.Materializer
 	netns          NetNSManager
 	maxSandboxes   int64
@@ -164,6 +171,7 @@ func New(cfg Config) (*SandboxNetDriver, error) {
 		kubeClient:     cfg.KubeClient,
 		store:          cfg.Store,
 		tunnel:         cfg.Tunnel,
+		ingress:        cfg.Ingress,
 		caMat:          caMat,
 		netns:          netnsMgr,
 		maxSandboxes:   maxSandboxes,
@@ -507,6 +515,9 @@ func (d *SandboxNetDriver) UnprepareResourceClaims(_ context.Context, claims []k
 			continue
 		}
 		var errs []error
+		if d.ingress != nil {
+			d.ingress.Revoke(podCfg.PodUID)
+		}
 		if err := d.tunnel.Remove(podCfg.PodUID); err != nil {
 			errs = append(errs, err)
 		}
@@ -550,6 +561,9 @@ func (d *SandboxNetDriver) Synchronize(ctx context.Context, pods []*nriapi.PodSa
 		}
 		pod, isLive := livePods[uid]
 		if !isLive {
+			if d.ingress != nil {
+				d.ingress.Revoke(uid)
+			}
 			_ = d.tunnel.Remove(uid)
 			_ = d.store.Delete(uid)
 			continue
@@ -783,6 +797,9 @@ func (d *SandboxNetDriver) StopPodSandbox(_ context.Context, pod *nriapi.PodSand
 	if _, ok := d.store.Get(podUID); !ok {
 		return nil
 	}
+	if d.ingress != nil {
+		d.ingress.Revoke(podUID)
+	}
 	d.tunnel.Revoke(podUID)
 	metrics.DriverHookRequestsTotal.WithLabelValues("StopPodSandbox", "success").Inc()
 	return nil
@@ -795,6 +812,9 @@ func (d *SandboxNetDriver) RemovePodSandbox(_ context.Context, pod *nriapi.PodSa
 		return nil
 	}
 	var errs []error
+	if d.ingress != nil {
+		d.ingress.Revoke(podUID)
+	}
 	if err := d.tunnel.Remove(podUID); err != nil {
 		errs = append(errs, err)
 	}

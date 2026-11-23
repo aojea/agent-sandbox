@@ -94,7 +94,9 @@ func (t Target) Resolve(scheme, clusterDomain, path, rawQuery string, lookup Loo
 		src = SourcePodIP
 	case lookup != nil:
 		if e, resolutionSource, ok := lookup.Resolve(t.Namespace, t.ID, types.UID(t.UID)); ok {
-			if e.PodIP == "" || e.SandboxUID == "" || e.Namespace != t.Namespace || e.SandboxName != t.ID {
+			hasDirectIP := e.PodIP != ""
+			hasSandboxNet := e.UsesSandboxNet && e.HostIP != ""
+			if (!hasDirectIP && !hasSandboxNet) || e.SandboxUID == "" || e.Namespace != t.Namespace || e.SandboxName != t.ID {
 				break
 			}
 			validResolution := true
@@ -107,7 +109,13 @@ func (t Target) Resolve(scheme, clusterDomain, path, rawQuery string, lookup Loo
 				validResolution = false
 			}
 			if validResolution {
-				host = e.PodIP
+				if hasDirectIP {
+					host = e.PodIP
+				} else {
+					// Synthetic per-PodUID host keeps http.Transport connection pools
+					// strictly isolated per Pod when dialing through sandbox-net ingress.
+					host = string(e.PodUID) + ".sandbox-net.local"
+				}
 				resolved = e
 			}
 		}

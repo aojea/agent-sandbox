@@ -219,9 +219,10 @@ func run(ctx context.Context, cfg *config.Config, log logr.Logger) (err error) {
 	if cfg.CacheEnabled {
 		var err error
 		podCache, err = cache.New(cache.Options{
-			Client:    k8sClient,
-			Log:       log.WithName("cache"),
-			Namespace: cfg.CacheNamespace,
+			Client:            k8sClient,
+			Log:               log.WithName("cache"),
+			Namespace:         cfg.CacheNamespace,
+			IncludeSandboxNet: cfg.SandboxNetIngressPort > 0,
 		})
 		if err != nil {
 			return fmt.Errorf("build pod cache: %w", err)

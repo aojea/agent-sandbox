@@ -254,6 +254,17 @@ func RegisterFlags(fs *flag.FlagSet, c *Config, lookup LookupEnvFunc) {
 	fs.StringVar(&c.CacheNamespace, "cache-namespace", c.CacheNamespace,
 		"Optional namespace filter for the Pod informer. Empty means "+
 			"cluster-wide. Ignored when --cache-enabled=false.")
+	fs.IntVar(&c.SandboxNetIngressPort, "sandbox-net-ingress-port", c.SandboxNetIngressPort,
+		"Host port of the node-local sandbox-net HTTP CONNECT ingress bridge "+
+			"(e.g. 15080). 0 disables sandbox-net ingress routing.")
+	fs.StringVar(&c.SandboxNetIngressCAFile, "sandbox-net-ingress-ca-file", c.SandboxNetIngressCAFile,
+		"Optional PEM CA bundle path to enable TLS and verify sandbox-net "+
+			"ingress bridge certificates.")
+	fs.StringVar(&c.SandboxNetIngressCertFile, "sandbox-net-ingress-cert-file", c.SandboxNetIngressCertFile,
+		"Optional PEM client certificate path for mTLS to the sandbox-net "+
+			"ingress bridge.")
+	fs.StringVar(&c.SandboxNetIngressKeyFile, "sandbox-net-ingress-key-file", c.SandboxNetIngressKeyFile,
+		"Optional PEM client key path for mTLS to the sandbox-net ingress bridge.")
 	// controller-runtime's pkg/client/config registers a "kubeconfig"
 	// flag in its package init. Detect that and reuse the existing
 	// flag rather than redefining it (Go's flag package panics on

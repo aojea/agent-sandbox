@@ -361,6 +361,21 @@ type Config struct {
 	// cross-origin requests are still proxied but the browser blocks the
 	// response. Each entry has the form scheme://host[:port].
 	GRPCWebAllowedOrigins []string
+
+	// SandboxNetIngressPort, when > 0, routes requests for sandbox-net Pods
+	// through the node-local sandbox-net HTTP CONNECT ingress bridge on
+	// <Pod.Status.HostIP>:<SandboxNetIngressPort> instead of dialing PodIP.
+	// Required to reach PodNetworkIsolated (no PodIP) and NetworkPolicyDenyAll
+	// sandboxes over their declared spec.network.ingressPorts. Zero disables
+	// sandbox-net ingress bridging.
+	SandboxNetIngressPort int
+	// SandboxNetIngressCAFile optionally points to a PEM CA bundle used to
+	// enable TLS and verify the node-local sandbox-net ingress listener.
+	SandboxNetIngressCAFile string
+	// SandboxNetIngressCertFile and SandboxNetIngressKeyFile optionally configure
+	// a PEM client certificate and key for mTLS to the sandbox-net ingress bridge.
+	SandboxNetIngressCertFile string
+	SandboxNetIngressKeyFile  string
 }
 
 // Defaults returns a Config populated with the default values used when no
@@ -556,6 +571,18 @@ func (c *Config) Validate() error {
 	}
 	if c.AuthzTrustForwardedProto && c.AuthzCookieName == "" {
 		return errors.New("--authz-trust-forwarded-proto has no effect without --authz-cookie-name, which is what runs the same-origin check it affects")
+	}
+	if c.SandboxNetIngressPort < 0 || c.SandboxNetIngressPort > 65535 {
+		return fmt.Errorf("--sandbox-net-ingress-port must be between 0 and 65535, got %d", c.SandboxNetIngressPort)
+	}
+	if c.SandboxNetIngressPort > 0 && !c.CacheEnabled {
+		return errors.New("--sandbox-net-ingress-port requires --cache-enabled to resolve sandbox-net Pods and host IPs")
+	}
+	if (c.SandboxNetIngressCertFile != "") != (c.SandboxNetIngressKeyFile != "") {
+		return errors.New("--sandbox-net-ingress-cert-file and --sandbox-net-ingress-key-file must be set together")
+	}
+	if c.SandboxNetIngressPort == 0 && (c.SandboxNetIngressCAFile != "" || c.SandboxNetIngressCertFile != "") {
+		return errors.New("--sandbox-net-ingress-ca-file and client cert flags require --sandbox-net-ingress-port > 0")
 	}
 	return nil
 }

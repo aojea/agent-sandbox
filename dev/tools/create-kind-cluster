@@ -38,6 +38,10 @@ def create_kind_config(kubelet_verbosity, containerd_loglevel=None):
               extraArgs:
                 - name: "enable-admission-plugins"
                   value: "NodeRestriction,OwnerReferencesPermissionEnforcement"
+                - name: "feature-gates"
+                  value: "ClusterTrustBundle=true"
+                - name: "runtime-config"
+                  value: "certificates.k8s.io/v1beta1=true"
           - |
             kind: KubeletConfiguration
             logging:

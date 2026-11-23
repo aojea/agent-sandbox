@@ -82,4 +82,17 @@ var (
 		},
 		[]string{"protocol", "auth_mode"},
 	)
+
+	// IngressConnectionsTotal counts host-side HTTP CONNECT ingress attempts into sandbox Pods.
+	// Labels are strictly bounded enums:
+	//   decision: allow | deny | error
+	//   reason:   allowed | malformed | unknown_sandbox | port_denied | not_ready | dial_failed
+	IngressConnectionsTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Subsystem: subsystem,
+			Name:      "ingress_connections_total",
+			Help:      "Total sandbox-net host ingress CONNECT attempts.",
+		},
+		[]string{"decision", "reason"},
+	)
 )

@@ -17,10 +17,12 @@
 package driver
 
 import (
+	"errors"
 	"fmt"
 	"net"
 
 	"github.com/vishvananda/netlink"
+	"golang.org/x/sys/unix"
 
 	"sigs.k8s.io/agent-sandbox/packages/sandbox-net/pkg/socketat"
 )
@@ -76,7 +78,7 @@ func (linuxNetNSManager) FlushNonLoopbackRoutes(netnsPath string) error {
 					return fmt.Errorf("list routes on %q: %w", link.Attrs().Name, err)
 				}
 				for i := range routes {
-					if err := handle.RouteDel(&routes[i]); err != nil {
+					if err := handle.RouteDel(&routes[i]); err != nil && !errors.Is(err, unix.ESRCH) {
 						return fmt.Errorf("delete route %v on %q: %w", routes[i], link.Attrs().Name, err)
 					}
 				}

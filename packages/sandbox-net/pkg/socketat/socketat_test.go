@@ -25,6 +25,7 @@ import (
 	"runtime"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
@@ -124,15 +125,16 @@ func runCrossNetNSHelper(t *testing.T) {
 		_, _ = io.Copy(c, c)
 	}()
 
-	// Dial from inside the pod netns via DoAtNS and verify round-trip echo with the host goroutine!
-	var conn net.Conn
-	if err := DoAtNS(int(podNS.Fd()), func() error {
-		var derr error
-		d := net.Dialer{FallbackDelay: -1}
-		conn, derr = d.Dial("tcp", ln.Addr().String())
-		return derr
-	}); err != nil {
-		t.Fatalf("dial pod loopback from pod netns: %v", err)
+	// Confirm host netns CANNOT connect to the Pod loopback listener directly (namespace isolation).
+	if hc, err := net.DialTimeout("tcp", ln.Addr().String(), 200*time.Millisecond); err == nil {
+		_ = hc.Close()
+		t.Fatalf("host netns unexpectedly connected to pod loopback %s", ln.Addr())
+	}
+
+	// Dial from host into the pod netns via DialAt and verify round-trip echo!
+	conn, err := DialAt(int(podNS.Fd()), "tcp", ln.Addr().String(), 2*time.Second)
+	if err != nil {
+		t.Fatalf("DialAt pod loopback: %v", err)
 	}
 	if _, err := io.WriteString(conn, "socketat-cross-netns-ok"); err != nil {
 		t.Fatalf("write: %v", err)
@@ -144,10 +146,18 @@ func runCrossNetNSHelper(t *testing.T) {
 		t.Fatalf("echo = %q err=%v, want socketat-cross-netns-ok", string(got), err)
 	}
 	<-accepted
+
+	// DialAt must reject non-IP hostnames so DNS resolution never spawns goroutines across netns.
+	if _, err := DialAt(int(podNS.Fd()), "tcp", "localhost:80", time.Second); err == nil {
+		t.Fatalf("expected error for non-IP address in DialAt")
+	}
 }
 
-func TestListenAtPathMissingNetNSReturnsError(t *testing.T) {
+func TestListenAtAndDialAtPathMissingNetNSReturnsError(t *testing.T) {
 	if _, err := ListenAtPath("/nonexistent/sandbox-net/ns", "tcp", "127.0.0.1:0"); err == nil {
-		t.Fatalf("expected error for missing netns path")
+		t.Fatalf("expected error for missing netns path in ListenAtPath")
+	}
+	if _, err := DialAtPath("/nonexistent/sandbox-net/ns", "tcp", "127.0.0.1:80", time.Second); err == nil {
+		t.Fatalf("expected error for missing netns path in DialAtPath")
 	}
 }

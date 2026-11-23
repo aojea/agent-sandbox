@@ -25,8 +25,10 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
+	"io"
 	"math/big"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -36,9 +38,11 @@ import (
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
+	certificatesv1beta1 "k8s.io/api/certificates/v1beta1"
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
 	networkingv1 "k8s.io/api/networking/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	resourcev1 "k8s.io/api/resource/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	k8sruntime "k8s.io/apimachinery/pkg/runtime"
@@ -59,280 +63,13 @@ const (
 	sandboxNetDaemonSetName    = "sandbox-net"
 )
 
-// testUpstreamProxyScript runs a self-contained TLS/mTLS/JWT HTTP CONNECT upstream proxy
-// using Python 3 stdlib so E2E tests exercise the real sandbox-net data path without extra images.
-const testUpstreamProxyScript = `
-import base64
-import http.server
-import json
-import os
-import signal
-import socket
-import ssl
-import sys
-import threading
+func sandboxNetTestUpstreamImage() string {
+	return fmt.Sprintf("%ssandbox-net-test-upstream:%s", getImagePrefix(), getImageTag())
+}
 
-signal.signal(signal.SIGTERM, lambda *_: os._exit(0))
-
-PROXY_PORT = int(os.environ.get("PROXY_PORT", "8443"))
-ADMIN_PORT = int(os.environ.get("ADMIN_PORT", "8081"))
-REQUIRE_MTLS = os.environ.get("REQUIRE_MTLS", "0") == "1"
-REQUIRE_AUD = os.environ.get("REQUIRE_BEARER_AUD", "")
-CERT_FILE = "/tls/tls.crt"
-KEY_FILE = "/tls/tls.key"
-CA_FILE = "/tls/ca.crt"
-
-records_lock = threading.Lock()
-records = []
-
-def decode_jwt_payload(token):
-    parts = token.split(".")
-    if len(parts) < 2:
-        return None
-    seg = parts[1] + "=" * ((4 - len(parts[1]) % 4) % 4)
-    try:
-        return json.loads(base64.urlsafe_b64decode(seg.encode("ascii")).decode("utf-8"))
-    except Exception:
-        return None
-
-def extract_cn(peer_cert):
-    if not peer_cert:
-        return ""
-    for rdn in peer_cert.get("subject", ()):
-        for k, v in rdn:
-            if k == "commonName":
-                return v
-    return ""
-
-def relay(src, dst):
-    try:
-        while True:
-            data = src.recv(16384)
-            if not data:
-                break
-            dst.sendall(data)
-    except Exception:
-        pass
-    finally:
-        try:
-            dst.shutdown(socket.SHUT_WR)
-        except Exception:
-            pass
-
-def read_http_head(conn):
-    buf = b""
-    while b"\r\n\r\n" not in buf:
-        chunk = conn.recv(4096)
-        if not chunk:
-            break
-        buf += chunk
-        if len(buf) > 65536:
-            return None, b""
-    if b"\r\n\r\n" not in buf:
-        return None, b""
-    head, rest = buf.split(b"\r\n\r\n", 1)
-    return head.decode("iso-8859-1"), rest
-
-def handle_client(raw_conn, tls_ctx):
-    conn = None
-    try:
-        conn = tls_ctx.wrap_socket(raw_conn, server_side=True)
-        peer_cn = extract_cn(conn.getpeercert()) if REQUIRE_MTLS else ""
-        head_text, leftover = read_http_head(conn)
-        if not head_text:
-            return
-        lines = head_text.split("\r\n")
-        parts = lines[0].split(" ")
-        if len(parts) != 3 or parts[0] != "CONNECT":
-            conn.sendall(b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-            return
-        target = parts[1]
-        hdrs = {}
-        for line in lines[1:]:
-            if ":" in line:
-                k, v = line.split(":", 1)
-                hdrs[k.strip().lower()] = v.strip()
-
-        jwt_sub = ""
-        jwt_aud = []
-        jwt_node = ""
-        if REQUIRE_AUD:
-            authz = hdrs.get("proxy-authorization", "")
-            if not authz.startswith("Bearer "):
-                conn.sendall(
-                    b'HTTP/1.1 407 Proxy Authentication Required\r\n'
-                    b'Proxy-Status: test-portal; error=http_request_denied; details="missing-bearer-token"\r\n'
-                    b'Content-Length: 0\r\nConnection: close\r\n\r\n'
-                )
-                return
-            payload = decode_jwt_payload(authz[len("Bearer "):].strip())
-            if not payload:
-                conn.sendall(
-                    b'HTTP/1.1 407 Proxy Authentication Required\r\n'
-                    b'Proxy-Status: test-portal; error=http_request_denied; details="invalid-jwt"\r\n'
-                    b'Content-Length: 0\r\nConnection: close\r\n\r\n'
-                )
-                return
-            aud = payload.get("aud", [])
-            if isinstance(aud, str):
-                aud = [aud]
-            if REQUIRE_AUD not in aud:
-                conn.sendall(
-                    b'HTTP/1.1 403 Forbidden\r\n'
-                    b'Proxy-Status: test-portal; error=http_request_denied; details="bad-audience"\r\n'
-                    b'Content-Length: 0\r\nConnection: close\r\n\r\n'
-                )
-                return
-            jwt_sub = payload.get("sub", "")
-            jwt_aud = aud
-            jwt_node = payload.get("kubernetes.io", {}).get("node", {}).get("name", "")
-
-        decision = "allow"
-        if "blocked" in target:
-            decision = "deny"
-
-        with records_lock:
-            records.append({
-                "target": target,
-                "headers": hdrs,
-                "peer_cn": peer_cn,
-                "jwt_sub": jwt_sub,
-                "jwt_aud": jwt_aud,
-                "jwt_node": jwt_node,
-                "decision": decision,
-            })
-
-        if decision == "deny":
-            conn.sendall(
-                b'HTTP/1.1 403 Forbidden\r\n'
-                b'Proxy-Status: test-portal; error=http_request_denied; details="blocked-by-portal"\r\n'
-                b'Content-Length: 0\r\nConnection: close\r\n\r\n'
-            )
-            return
-
-        host, port_s = target.rsplit(":", 1)
-        host = host.strip("[]")
-        port = int(port_s)
-        dst = socket.create_connection((host, port), timeout=10)
-        try:
-            conn.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-            if leftover:
-                dst.sendall(leftover)
-            t1 = threading.Thread(target=relay, args=(conn, dst), daemon=True)
-            t2 = threading.Thread(target=relay, args=(dst, conn), daemon=True)
-            t1.start()
-            t2.start()
-            t1.join()
-            t2.join()
-        finally:
-            try:
-                dst.close()
-            except Exception:
-                pass
-    except Exception as exc:
-        print(f"proxy error: {exc}", file=sys.stderr, flush=True)
-    finally:
-        try:
-            if conn is not None:
-                conn.close()
-            else:
-                raw_conn.close()
-        except Exception:
-            pass
-
-class AdminHandler(http.server.BaseHTTPRequestHandler):
-    def do_GET(self):
-        if self.path == "/healthz":
-            self.send_response(200)
-            self.end_headers()
-            self.wfile.write(b"ok\n")
-            return
-        if self.path == "/records":
-            with records_lock:
-                body = json.dumps(records).encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-            return
-        self.send_response(404)
-        self.end_headers()
-
-    def log_message(self, format, *args):
-        pass
-
-def main():
-    tls_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    tls_ctx.load_cert_chain(certfile=CERT_FILE, keyfile=KEY_FILE)
-    if REQUIRE_MTLS:
-        tls_ctx.verify_mode = ssl.CERT_REQUIRED
-        tls_ctx.load_verify_locations(cafile=CA_FILE)
-
-    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind(("0.0.0.0", PROXY_PORT))
-    srv.listen(128)
-
-    # Start /healthz admin server only after PROXY_PORT is listening.
-    admin_srv = http.server.ThreadingHTTPServer(("0.0.0.0", ADMIN_PORT), AdminHandler)
-    threading.Thread(target=admin_srv.serve_forever, daemon=True).start()
-
-    while True:
-        c, _ = srv.accept()
-        threading.Thread(target=handle_client, args=(c, tls_ctx), daemon=True).start()
-
-if __name__ == "__main__":
-    main()
-`
-
-// testDestServerScript serves both HTTPS (8443, signed by our custom test CA) and plain HTTP (8080).
-const testDestServerScript = `
-import http.server
-import json
-import os
-import signal
-import ssl
-import threading
-
-signal.signal(signal.SIGTERM, lambda *_: os._exit(0))
-
-def make_handler(scheme):
-    class Handler(http.server.BaseHTTPRequestHandler):
-        def do_GET(self):
-            if self.path == "/healthz":
-                self.send_response(200)
-                self.end_headers()
-                self.wfile.write(b"ok\n")
-                return
-            body = json.dumps({
-                "scheme": scheme,
-                "path": self.path,
-                "host": self.headers.get("Host", ""),
-            }).encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-
-        def log_message(self, format, *args):
-            pass
-    return Handler
-
-def main():
-    http_srv = http.server.ThreadingHTTPServer(("0.0.0.0", 8080), make_handler("http"))
-    https_srv = http.server.ThreadingHTTPServer(("0.0.0.0", 8443), make_handler("https"))
-    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    ctx.load_cert_chain(certfile="/tls/tls.crt", keyfile="/tls/tls.key")
-    https_srv.socket = ctx.wrap_socket(https_srv.socket, server_side=True)
-
-    threading.Thread(target=http_srv.serve_forever, daemon=True).start()
-    https_srv.serve_forever()
-
-if __name__ == "__main__":
-    main()
-`
+func sandboxRouterGoImage() string {
+	return fmt.Sprintf("%ssandbox-router-go:%s", getImagePrefix(), getImageTag())
+}
 
 type e2ePKI struct {
 	caCert    *x509.Certificate
@@ -411,13 +148,19 @@ func (p *e2ePKI) issueCert(t *testing.T, cn string, dnsNames []string, ips []net
 }
 
 type upstreamProxyRecord struct {
-	Target   string            `json:"target"`
-	Headers  map[string]string `json:"headers"`
-	PeerCN   string            `json:"peer_cn"`
-	JWTSub   string            `json:"jwt_sub"`
-	JWTAud   []string          `json:"jwt_aud"`
-	JWTNode  string            `json:"jwt_node"`
-	Decision string            `json:"decision"`
+	Target    string            `json:"target"`
+	Protocol  string            `json:"protocol"`
+	Transport string            `json:"transport"`
+	Headers   map[string]string `json:"headers"`
+	PeerCN    string            `json:"peer_cn"`
+	JWTSub    string            `json:"jwt_sub"`
+	JWTAud    []string          `json:"jwt_aud"`
+	JWTNode   string            `json:"jwt_node"`
+	Decision  string            `json:"decision"`
+}
+
+type upstreamProxyStats struct {
+	TLSConnections int64 `json:"tls_connections"`
 }
 
 func repoRootFromE2E(t *testing.T) string {
@@ -522,14 +265,9 @@ func kubectlRun(ctx context.Context, args ...string) (string, string, error) {
 	return stdout.String(), stderr.String(), err
 }
 
-func execInPod(ctx context.Context, t *testing.T, ns, pod, container string, command ...string) (string, string, error) {
+func execInAgentPod(ctx context.Context, t *testing.T, ns, pod string, command ...string) (string, string, error) {
 	t.Helper()
-	args := []string{"exec", "-n", ns, pod}
-	if container != "" {
-		args = append(args, "-c", container)
-	}
-	args = append(args, "--")
-	args = append(args, command...)
+	args := append([]string{"exec", "-n", ns, pod, "-c", "agent", "--"}, command...)
 	return kubectlRun(ctx, args...)
 }
 
@@ -636,13 +374,7 @@ func deployTestInfra(t *testing.T, tc *framework.TestContext, prefix string, opt
 			"ca.crt":  upstreamPKI.caCertPEM,
 		},
 	})
-	mustCreate(&corev1.ConfigMap{
-		ObjectMeta: metav1.ObjectMeta{Name: "test-scripts", Namespace: ns.Name},
-		Data: map[string]string{
-			"upstream_proxy.py": testUpstreamProxyScript,
-			"dest_server.py":    testDestServerScript,
-		},
-	})
+	upstreamImage := sandboxNetTestUpstreamImage()
 
 	destPod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
@@ -655,12 +387,14 @@ func deployTestInfra(t *testing.T, tc *framework.TestContext, prefix string, opt
 			TerminationGracePeriodSeconds: new(int64(1)),
 			Containers: []corev1.Container{
 				{
-					Name:    "dest",
-					Image:   sandboxNetE2EWorkloadImage,
-					Command: []string{"python3", "/scripts/dest_server.py"},
+					Name:            "dest",
+					Image:           upstreamImage,
+					ImagePullPolicy: corev1.PullIfNotPresent,
+					Args:            []string{"--mode=dest"},
 					Ports: []corev1.ContainerPort{
 						{ContainerPort: 8080},
 						{ContainerPort: 8443},
+						{ContainerPort: 5353, Protocol: corev1.ProtocolUDP},
 					},
 					ReadinessProbe: &corev1.Probe{
 						ProbeHandler: corev1.ProbeHandler{
@@ -669,13 +403,11 @@ func deployTestInfra(t *testing.T, tc *framework.TestContext, prefix string, opt
 						PeriodSeconds: 1,
 					},
 					VolumeMounts: []corev1.VolumeMount{
-						{Name: "scripts", MountPath: "/scripts", ReadOnly: true},
 						{Name: "tls", MountPath: "/tls", ReadOnly: true},
 					},
 				},
 			},
 			Volumes: []corev1.Volume{
-				{Name: "scripts", VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{LocalObjectReference: corev1.LocalObjectReference{Name: "test-scripts"}}}},
 				{Name: "tls", VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: "dest-ca-tls"}}},
 			},
 		},
@@ -689,20 +421,18 @@ func deployTestInfra(t *testing.T, tc *framework.TestContext, prefix string, opt
 			Ports: []corev1.ServicePort{
 				{Name: "http", Port: 8080, TargetPort: intstr.FromInt32(8080)},
 				{Name: "https", Port: 8443, TargetPort: intstr.FromInt32(8443)},
+				{Name: "udp", Port: 5353, Protocol: corev1.ProtocolUDP, TargetPort: intstr.FromInt32(5353)},
 			},
 		},
 	}
 	mustCreate(destSvc)
 
-	proxyEnv := []corev1.EnvVar{
-		{Name: "PROXY_PORT", Value: "8443"},
-		{Name: "ADMIN_PORT", Value: "8081"},
-	}
+	proxyArgs := []string{"--mode=proxy", "--proxy-addr=:8443", "--admin-addr=:8081"}
 	if opts.requireMTLS {
-		proxyEnv = append(proxyEnv, corev1.EnvVar{Name: "REQUIRE_MTLS", Value: "1"})
+		proxyArgs = append(proxyArgs, "--require-mtls=true")
 	}
 	if opts.requireBearerAud != "" {
-		proxyEnv = append(proxyEnv, corev1.EnvVar{Name: "REQUIRE_BEARER_AUD", Value: opts.requireBearerAud})
+		proxyArgs = append(proxyArgs, "--require-bearer-aud="+opts.requireBearerAud)
 	}
 
 	proxyPod := &corev1.Pod{
@@ -716,10 +446,10 @@ func deployTestInfra(t *testing.T, tc *framework.TestContext, prefix string, opt
 			TerminationGracePeriodSeconds: new(int64(1)),
 			Containers: []corev1.Container{
 				{
-					Name:    "proxy",
-					Image:   sandboxNetE2EWorkloadImage,
-					Command: []string{"python3", "/scripts/upstream_proxy.py"},
-					Env:     proxyEnv,
+					Name:            "proxy",
+					Image:           upstreamImage,
+					ImagePullPolicy: corev1.PullIfNotPresent,
+					Args:            proxyArgs,
 					Ports: []corev1.ContainerPort{
 						{ContainerPort: 8443},
 						{ContainerPort: 8081},
@@ -731,13 +461,11 @@ func deployTestInfra(t *testing.T, tc *framework.TestContext, prefix string, opt
 						PeriodSeconds: 1,
 					},
 					VolumeMounts: []corev1.VolumeMount{
-						{Name: "scripts", MountPath: "/scripts", ReadOnly: true},
 						{Name: "tls", MountPath: "/tls", ReadOnly: true},
 					},
 				},
 			},
 			Volumes: []corev1.Volume{
-				{Name: "scripts", VolumeSource: corev1.VolumeSource{ConfigMap: &corev1.ConfigMapVolumeSource{LocalObjectReference: corev1.LocalObjectReference{Name: "test-scripts"}}}},
 				{Name: "tls", VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: "upstream-proxy-tls"}}},
 			},
 		},
@@ -759,8 +487,8 @@ func deployTestInfra(t *testing.T, tc *framework.TestContext, prefix string, opt
 	tc.MustWaitForObject(destPod, predicates.ReadyConditionIsTrue)
 	tc.MustWaitForObject(proxyPod, predicates.ReadyConditionIsTrue)
 
-	// Wait for EndpointSlices to report Ready endpoints and verify the proxy Service ClusterIP
-	// is reachable from inside the cluster so tests do not race kube-proxy sync.
+	// Wait for EndpointSlices to report Ready endpoints and verify the proxy admin Service
+	// responds before creating Sandboxes.
 	for _, svcName := range []string{"dest-server", "upstream-proxy"} {
 		err := wait.PollUntilContextTimeout(ctx, 250*time.Millisecond, 30*time.Second, true, func(pollCtx context.Context) (bool, error) {
 			var esList discoveryv1.EndpointSliceList
@@ -780,13 +508,13 @@ func deployTestInfra(t *testing.T, tc *framework.TestContext, prefix string, opt
 			t.Fatalf("EndpointSlice for Service %s/%s not ready: %v", ns.Name, svcName, err)
 		}
 	}
-	err := wait.PollUntilContextTimeout(ctx, 500*time.Millisecond, 30*time.Second, true, func(pollCtx context.Context) (bool, error) {
-		out, _, execErr := execInPod(pollCtx, t, ns.Name, proxyPod.Name, "proxy",
-			"python3", "-c", fmt.Sprintf("import socket; s=socket.create_connection((%q, 8443), timeout=2); s.close(); print('OK')", upstreamFQDN))
-		return execErr == nil && strings.Contains(out, "OK"), nil
+	healthzPath := fmt.Sprintf("/api/v1/namespaces/%s/services/upstream-proxy:8081/proxy/healthz", ns.Name)
+	err := wait.PollUntilContextTimeout(ctx, 250*time.Millisecond, 30*time.Second, true, func(pollCtx context.Context) (bool, error) {
+		out, _, cmdErr := kubectlRun(pollCtx, "get", "--raw", healthzPath)
+		return cmdErr == nil && strings.Contains(out, "ok"), nil
 	})
 	if err != nil {
-		t.Fatalf("upstream-proxy Service %s:8443 not reachable via kube-proxy: %v", upstreamFQDN, err)
+		t.Fatalf("upstream-proxy admin endpoint %s not ready: %v", healthzPath, err)
 	}
 
 	var gotDestSvc corev1.Service
@@ -820,8 +548,8 @@ func deployTestInfra(t *testing.T, tc *framework.TestContext, prefix string, opt
 
 func fetchUpstreamRecords(ctx context.Context, t *testing.T, infra *testInfra) []upstreamProxyRecord {
 	t.Helper()
-	stdout, stderr, err := execInPod(ctx, t, infra.namespace, infra.proxyPodName, "proxy",
-		"python3", "-c", "import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:8081/records', timeout=5).read().decode())")
+	rawPath := fmt.Sprintf("/api/v1/namespaces/%s/services/upstream-proxy:8081/proxy/records", infra.namespace)
+	stdout, stderr, err := kubectlRun(ctx, "get", "--raw", rawPath)
 	if err != nil {
 		t.Fatalf("fetch upstream records failed: %v (stderr=%s)", err, stderr)
 	}
@@ -830,6 +558,20 @@ func fetchUpstreamRecords(ctx context.Context, t *testing.T, infra *testInfra) [
 		t.Fatalf("parse upstream records %q: %v", stdout, err)
 	}
 	return recs
+}
+
+func fetchUpstreamStats(ctx context.Context, t *testing.T, infra *testInfra) upstreamProxyStats {
+	t.Helper()
+	rawPath := fmt.Sprintf("/api/v1/namespaces/%s/services/upstream-proxy:8081/proxy/stats", infra.namespace)
+	stdout, stderr, err := kubectlRun(ctx, "get", "--raw", rawPath)
+	if err != nil {
+		t.Fatalf("fetch upstream stats failed: %v (stderr=%s)", err, stderr)
+	}
+	var stats upstreamProxyStats
+	if err := json.Unmarshal([]byte(strings.TrimSpace(stdout)), &stats); err != nil {
+		t.Fatalf("parse upstream stats %q: %v", stdout, err)
+	}
+	return stats
 }
 
 func pythonWorkloadPodTemplate(extraEnv ...corev1.EnvVar) sandboxv1beta1.PodTemplate {
@@ -1038,7 +780,7 @@ assert "Boundary-Reason:" in blk_resp and "blocked-by-portal" in blk_resp, f"mis
 print("ALL_CHECKS_PASSED")
 `, infra.destServiceIP, infra.destFQDN, infra.destFQDN, infra.destFQDN, infra.destFQDN, infra.destFQDN)
 
-	stdout, stderr, err := execInPod(ctx, t, infra.namespace, pod.Name, "agent", "python3", "-c", probeScript)
+	stdout, stderr, err := execInAgentPod(ctx, t, infra.namespace, pod.Name, "python3", "-c", probeScript)
 	if err != nil || !strings.Contains(stdout, "ALL_CHECKS_PASSED") {
 		t.Fatalf("in-sandbox probe failed: err=%v\nstdout=%s\nstderr=%s", err, stdout, stderr)
 	}
@@ -1155,7 +897,7 @@ assert body["path"] == "/mtls-ok", f"unexpected body: {body}"
 print("MTLS_OK")
 `, infra.destFQDN)
 
-	stdout, stderr, err := execInPod(ctx, t, infra.namespace, sb.Name, "agent", "python3", "-c", probeScript)
+	stdout, stderr, err := execInAgentPod(ctx, t, infra.namespace, sb.Name, "python3", "-c", probeScript)
 	if err != nil || !strings.Contains(stdout, "MTLS_OK") {
 		t.Fatalf("mTLS probe failed: err=%v\nstdout=%s\nstderr=%s", err, stdout, stderr)
 	}
@@ -1232,7 +974,7 @@ assert body["path"] == "/jwt-ok", f"unexpected body: {body}"
 print("JWT_OK")
 `, infra.destFQDN)
 
-	stdout, stderr, err := execInPod(ctx, t, infra.namespace, sb.Name, "agent", "python3", "-c", probeScript)
+	stdout, stderr, err := execInAgentPod(ctx, t, infra.namespace, sb.Name, "python3", "-c", probeScript)
 	if err != nil || !strings.Contains(stdout, "JWT_OK") {
 		t.Fatalf("ServiceAccountToken probe failed: err=%v\nstdout=%s\nstderr=%s", err, stdout, stderr)
 	}
@@ -1331,7 +1073,7 @@ func TestSandboxNetLifecycleSuspendAndResume(t *testing.T) {
 		t.Fatalf("expected new ResourceClaim UID after resume, still %s", resumedClaim.UID)
 	}
 
-	stdout, stderr, err := execInPod(ctx, t, infra.namespace, sb.Name, "agent",
+	stdout, stderr, err := execInAgentPod(ctx, t, infra.namespace, sb.Name,
 		"python3", "-c", fmt.Sprintf("import urllib.request; print(urllib.request.urlopen('https://%s:8443/resumed', timeout=10).read().decode())", infra.destFQDN))
 	if err != nil || !strings.Contains(stdout, "/resumed") {
 		t.Fatalf("resumed HTTPS request failed: err=%v stdout=%s stderr=%s", err, stdout, stderr)
@@ -1453,7 +1195,7 @@ func TestSandboxNetWarmPoolAdoptionIdentitySync(t *testing.T) {
 	// Poll until sandbox-net's Pod informer observes the adopted claim labels/annotations and
 	// stamps Agents-Net-Claim-Name and Agents-Net-Claim-Uid on upstream CONNECT requests.
 	err = wait.PollUntilContextTimeout(ctx, 2*time.Second, 30*time.Second, true, func(pollCtx context.Context) (bool, error) {
-		stdout, _, execErr := execInPod(pollCtx, t, infra.namespace, adoptedPodName, "agent",
+		stdout, _, execErr := execInAgentPod(pollCtx, t, infra.namespace, adoptedPodName,
 			"python3", "-c", fmt.Sprintf("import urllib.request; print(urllib.request.urlopen('https://%s:8443/adopted', timeout=5).read().decode())", infra.destFQDN))
 		if execErr != nil || !strings.Contains(stdout, "/adopted") {
 			return false, nil
@@ -1584,7 +1326,7 @@ assert body["path"] == "/dc-ok", f"unexpected body: {body}"
 print("DC_OK")
 `, infra.destFQDN)
 
-	stdout, stderr, err := execInPod(ctx, t, infra.namespace, sb.Name, "agent", "python3", "-c", probeScript)
+	stdout, stderr, err := execInAgentPod(ctx, t, infra.namespace, sb.Name, "python3", "-c", probeScript)
 	if err != nil || !strings.Contains(stdout, "DC_OK") {
 		t.Fatalf("DeviceClass override probe failed: err=%v\nstdout=%s\nstderr=%s", err, stdout, stderr)
 	}
@@ -1598,5 +1340,487 @@ print("DC_OK")
 		h["agents-net-param-shared"] != "from-sandbox" ||
 		h["agents-net-param-workload"] != "override-test" {
 		t.Fatalf("unexpected merged Agents-Net-Param-* headers: %+v", h)
+	}
+}
+
+// TestSandboxNetIngressViaSandboxRouter validates host-side ingress enforcement end-to-end:
+//   - sandbox Pod binds HTTP listeners strictly on 127.0.0.1:8080 (declared in ingressPorts)
+//     and 127.0.0.1:9999 (undeclared) so direct PodIP traffic cannot reach them
+//   - sandbox-router-go routes traffic through sandbox-net's host HTTP CONNECT bridge (:15080)
+//   - declared port 8080 succeeds via socketat.DialAtPath into the Pod loopback
+//   - undeclared port 9999 is denied with 403 ingress-port-denied
+//   - suspending the Sandbox immediately revokes ingress
+func TestSandboxNetIngressViaSandboxRouter(t *testing.T) {
+	tc := framework.NewTestContext(t)
+	ctx := t.Context()
+	ensureSandboxNetDeployed(t, tc)
+
+	ns := &corev1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: fmt.Sprintf("snet-ingress-%d", time.Now().UnixNano()),
+		},
+	}
+	if err := tc.CreateWithCleanup(ctx, ns); err != nil {
+		t.Fatalf("create namespace: %v", err)
+	}
+
+	mustCreate := func(obj client.Object) {
+		if err := tc.CreateWithCleanup(ctx, obj); err != nil {
+			t.Fatalf("create %T %s/%s: %v", obj, obj.GetNamespace(), obj.GetName(), err)
+		}
+	}
+
+	// Serve two loopback-only HTTP servers inside the isolated sandbox Pod:
+	// 127.0.0.1:8080 (allowed by ingressPorts) and 127.0.0.1:9999 (denied).
+	loopbackServersScript := `
+import http.server, os, signal, threading
+signal.signal(signal.SIGTERM, lambda *_: os._exit(0))
+def make_handler(tag):
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = f"{tag}:{self.path}".encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        def log_message(self, *args):
+            pass
+    return H
+s8080 = http.server.ThreadingHTTPServer(("127.0.0.1", 8080), make_handler("loopback-8080"))
+s9999 = http.server.ThreadingHTTPServer(("127.0.0.1", 9999), make_handler("loopback-9999"))
+threading.Thread(target=s9999.serve_forever, daemon=True).start()
+s8080.serve_forever()
+`
+	sb := &sandboxv1beta1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "sb-ingress",
+			Namespace: ns.Name,
+		},
+		Spec: sandboxv1beta1.SandboxSpec{
+			SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{
+				PodTemplate: sandboxv1beta1.PodTemplate{
+					Spec: corev1.PodSpec{
+						AutomountServiceAccountToken:  new(false),
+						TerminationGracePeriodSeconds: new(int64(1)),
+						SecurityContext: &corev1.PodSecurityContext{
+							RunAsNonRoot: new(true),
+							RunAsUser:    new(int64(1000)),
+							RunAsGroup:   new(int64(1000)),
+						},
+						Containers: []corev1.Container{
+							{
+								Name:    "agent",
+								Image:   sandboxNetE2EWorkloadImage,
+								Command: []string{"python3", "-c", loopbackServersScript},
+								ReadinessProbe: &corev1.Probe{
+									ProbeHandler: corev1.ProbeHandler{
+										Exec: &corev1.ExecAction{
+											Command: []string{
+												"python3", "-c",
+												"import socket; [socket.create_connection(('127.0.0.1', p), timeout=1).close() for p in (8080, 9999)]",
+											},
+										},
+									},
+									PeriodSeconds: 1,
+								},
+								SecurityContext: &corev1.SecurityContext{
+									AllowPrivilegeEscalation: new(false),
+									Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
+								},
+							},
+						},
+					},
+				},
+				Network: &sandboxv1beta1.SandboxNetworkSpec{
+					ConfinementMode: sandboxv1beta1.SandboxConfinementModeNetworkPolicyDenyAll,
+					AdapterMode:     sandboxv1beta1.SandboxAdapterModeExplicitProxy,
+					IngressPorts: []sandboxv1beta1.SandboxIngressPort{
+						{Port: 8080, Protocol: sandboxv1beta1.SandboxIngressProtocolTCP},
+					},
+				},
+			},
+		},
+	}
+	mustCreate(sb)
+	tc.MustWaitForObject(sb, predicates.ReadyConditionIsTrue)
+
+	// Deploy sandbox-router-go scoped to this namespace with Pod cache + sandbox-net ingress enabled.
+	mustCreate(&corev1.ServiceAccount{
+		ObjectMeta: metav1.ObjectMeta{Name: "sandbox-router", Namespace: ns.Name},
+	})
+	mustCreate(&rbacv1.Role{
+		ObjectMeta: metav1.ObjectMeta{Name: "sandbox-router-pods", Namespace: ns.Name},
+		Rules: []rbacv1.PolicyRule{
+			{APIGroups: []string{""}, Resources: []string{"pods"}, Verbs: []string{"get", "list", "watch"}},
+		},
+	})
+	mustCreate(&rbacv1.RoleBinding{
+		ObjectMeta: metav1.ObjectMeta{Name: "sandbox-router-pods", Namespace: ns.Name},
+		RoleRef: rbacv1.RoleRef{
+			APIGroup: rbacv1.GroupName,
+			Kind:     "Role",
+			Name:     "sandbox-router-pods",
+		},
+		Subjects: []rbacv1.Subject{
+			{Kind: rbacv1.ServiceAccountKind, Name: "sandbox-router", Namespace: ns.Name},
+		},
+	})
+
+	routerPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "sandbox-router",
+			Namespace: ns.Name,
+			Labels:    map[string]string{"app": "sandbox-router"},
+		},
+		Spec: corev1.PodSpec{
+			ServiceAccountName:            "sandbox-router",
+			TerminationGracePeriodSeconds: new(int64(1)),
+			Containers: []corev1.Container{
+				{
+					Name:            "router",
+					Image:           sandboxRouterGoImage(),
+					ImagePullPolicy: corev1.PullIfNotPresent,
+					Args: []string{
+						"--cache-enabled=true",
+						"--cache-namespace=" + ns.Name,
+						"--authz-mode=allow-all",
+						"--sandbox-net-ingress-port=15080",
+					},
+					ReadinessProbe: &corev1.Probe{
+						ProbeHandler: corev1.ProbeHandler{
+							HTTPGet: &corev1.HTTPGetAction{Path: "/readyz", Port: intstr.FromInt32(8081)},
+						},
+						PeriodSeconds: 1,
+					},
+					SecurityContext: &corev1.SecurityContext{
+						RunAsNonRoot:             new(true),
+						AllowPrivilegeEscalation: new(false),
+						Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
+					},
+				},
+			},
+		},
+	}
+	mustCreate(routerPod)
+	t.Cleanup(func() {
+		if t.Failed() {
+			dumpPodLogsBySelector(t, ns.Name, "app=sandbox-router")
+		}
+	})
+	tc.MustWaitForObject(routerPod, predicates.ReadyConditionIsTrue)
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("allocate local port: %v", err)
+	}
+	localPort := ln.Addr().(*net.TCPAddr).Port
+	_ = ln.Close()
+
+	pfCtx, stopPF := context.WithCancel(ctx)
+	defer stopPF()
+	if err := tc.PortForward(pfCtx, types.NamespacedName{Namespace: ns.Name, Name: routerPod.Name}, localPort, 8080); err != nil {
+		t.Fatalf("PortForward sandbox-router: %v", err)
+	}
+
+	httpCli := &http.Client{Timeout: 5 * time.Second}
+	callRouter := func(port, path string) (int, string, error) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("http://127.0.0.1:%d%s", localPort, path), nil)
+		if err != nil {
+			return 0, "", err
+		}
+		req.Header.Set("X-Sandbox-Id", sb.Name)
+		req.Header.Set("X-Sandbox-Namespace", ns.Name)
+		req.Header.Set("X-Sandbox-Port", port)
+		resp, err := httpCli.Do(req)
+		if err != nil {
+			return 0, "", err
+		}
+		body, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		return resp.StatusCode, string(body), nil
+	}
+
+	// 1. Declared ingress port 8080 reaches the loopback-only server via sandbox-net ingress bridge.
+	err = wait.PollUntilContextTimeout(ctx, 250*time.Millisecond, 15*time.Second, true, func(_ context.Context) (bool, error) {
+		code, body, reqErr := callRouter("8080", "/hello")
+		return reqErr == nil && code == http.StatusOK && body == "loopback-8080:/hello", nil
+	})
+	if err != nil {
+		code, body, reqErr := callRouter("8080", "/hello")
+		t.Fatalf("allowed ingress port 8080 failed: err=%v last=(code=%d body=%q reqErr=%v)", err, code, body, reqErr)
+	}
+
+	// 2. Undeclared port 9999 MUST be rejected with 403 ingress-port-denied by sandbox-net.
+	code, body, err := callRouter("9999", "/secret")
+	if err != nil {
+		t.Fatalf("denied ingress port request failed: %v", err)
+	}
+	if code != http.StatusForbidden || !strings.Contains(body, "ingress-port-denied") {
+		t.Fatalf("undeclared port 9999: status=%d body=%q, want 403 ingress-port-denied", code, body)
+	}
+
+	// 3. Suspending the Sandbox deletes the Pod and revokes ingress immediately.
+	framework.MustUpdateObject(tc.ClusterClient, sb, func(obj *sandboxv1beta1.Sandbox) {
+		obj.Spec.OperatingMode = sandboxv1beta1.SandboxOperatingModeSuspended
+	})
+	if err := tc.WaitForObjectNotFound(ctx, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: sb.Name, Namespace: ns.Name}}); err != nil {
+		t.Fatalf("Pod not deleted on suspend: %v", err)
+	}
+	err = wait.PollUntilContextTimeout(ctx, 250*time.Millisecond, 10*time.Second, true, func(_ context.Context) (bool, error) {
+		c, _, reqErr := callRouter("8080", "/after-suspend")
+		return reqErr == nil && c != http.StatusOK, nil
+	})
+	if err != nil {
+		t.Fatalf("ingress still returned 200 after Sandbox suspend: %v", err)
+	}
+}
+
+// TestSandboxNetHTTP2AndConnectUDP validates:
+//   - default upstream.protocol (HTTP2) multiplexed CONNECT over a shared TLS connection
+//   - HTTP/2 upstream 403 Proxy-Status forwarding to the sandbox
+//   - RFC 9298 connect-udp capsule relay over /run/agents.net/egress.sock to dest-server:5353
+func TestSandboxNetHTTP2AndConnectUDP(t *testing.T) {
+	tc := framework.NewTestContext(t)
+	ctx := t.Context()
+	ensureSandboxNetDeployed(t, tc)
+	infra := deployTestInfra(t, tc, "snet-h2-udp", testUpstreamOpts{})
+
+	sb := &sandboxv1beta1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "sb-h2-udp",
+			Namespace: infra.namespace,
+		},
+		Spec: sandboxv1beta1.SandboxSpec{
+			SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{
+				PodTemplate: pythonWorkloadPodTemplate(),
+				Network: &sandboxv1beta1.SandboxNetworkSpec{
+					ConfinementMode: sandboxv1beta1.SandboxConfinementModeNetworkPolicyDenyAll,
+					AdapterMode:     sandboxv1beta1.SandboxAdapterModeExplicitProxy,
+					Upstream: &sandboxv1beta1.SandboxNetworkUpstream{
+						// Protocol omitted deliberately to test the default HTTP2 path.
+						Address: infra.upstreamAddr,
+						TLS: &sandboxv1beta1.SandboxUpstreamTLS{
+							CACertificateRefs: []sandboxv1beta1.SandboxCASource{
+								{
+									Type:         sandboxv1beta1.SandboxCASourceTypeConfigMap,
+									ConfigMapRef: &sandboxv1beta1.SandboxConfigMapKeyRef{Name: infra.upstreamCACM},
+								},
+							},
+						},
+					},
+					CATrust: &sandboxv1beta1.SandboxCATrustSpec{
+						Mode: sandboxv1beta1.SandboxCATrustModeInjectEnv,
+						Sources: []sandboxv1beta1.SandboxCASource{
+							{
+								Type:      sandboxv1beta1.SandboxCASourceTypeSecret,
+								SecretRef: &sandboxv1beta1.SandboxSecretKeyRef{Name: infra.destCASec},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	if err := tc.CreateWithCleanup(ctx, sb); err != nil {
+		t.Fatalf("create Sandbox: %v", err)
+	}
+	tc.MustWaitForObject(sb, predicates.ReadyConditionIsTrue)
+
+	probeScript := fmt.Sprintf(`
+import json, os, socket, urllib.request
+
+# 1. Two HTTPS requests over the default HTTP/2 CONNECT upstream tunnel.
+for path in ("/h2-one", "/h2-two"):
+    body = json.loads(urllib.request.urlopen(f"https://%s:8443{path}", timeout=10).read().decode())
+    assert body["scheme"] == "https" and body["path"] == path, f"bad H2 body: {body}"
+
+# 2. Blocked target over HTTP/2 CONNECT returns 403 + Proxy-Status.
+blk = socket.create_connection(("127.0.0.1", 15001), timeout=5)
+blk.sendall(b"CONNECT blocked.example:443 HTTP/1.1\r\nHost: blocked.example:443\r\n\r\n")
+blk_resp = blk.recv(4096).decode("iso-8859-1")
+blk.close()
+assert blk_resp.startswith("HTTP/1.1 403 ") and "blocked-by-portal" in blk_resp, f"bad H2 deny: {blk_resp!r}"
+
+# 3. RFC 9298 connect-udp capsule relay over /run/agents.net/egress.sock to dest-server UDP echo (:5353).
+uds = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+uds.settimeout(10)
+uds.connect(os.environ["AGENTS_NET_EGRESS_SOCKET"])
+req = (
+    "GET /.well-known/masque/udp/%s/5353/ HTTP/1.1\r\n"
+    "Host: egress.local\r\n"
+    "Connection: Upgrade\r\n"
+    "Upgrade: connect-udp\r\n"
+    "Capsule-Protocol: ?1\r\n\r\n"
+).encode("ascii")
+uds.sendall(req)
+
+buf = b""
+while b"\r\n\r\n" not in buf:
+    chunk = uds.recv(4096)
+    assert chunk, "EOF waiting for 101 Switching Protocols"
+    buf += chunk
+head, rest = buf.split(b"\r\n\r\n", 1)
+assert head.startswith(b"HTTP/1.1 101 "), f"connect-udp upgrade failed: {head!r}"
+
+# Write RFC 9298 DATAGRAM capsule: type=0, length=1+len(payload), context_id=0, payload.
+payload = b"masque-e2e-ping"
+capsule = bytes([0, len(payload) + 1, 0]) + payload
+uds.sendall(capsule)
+
+want = b"udp-echo:" + payload
+while len(rest) < 3 + len(want):
+    chunk = uds.recv(4096)
+    assert chunk, f"EOF reading UDP echo capsule, got {rest!r}"
+    rest += chunk
+uds.close()
+assert rest[0] == 0 and rest[2] == 0, f"unexpected capsule framing: {rest!r}"
+got_len = rest[1] - 1
+got_payload = rest[3:3 + got_len]
+assert got_payload == want, f"UDP echo mismatch: got {got_payload!r}, want {want!r}"
+print("H2_AND_UDP_OK")
+`, infra.destFQDN, infra.destFQDN)
+
+	stdout, stderr, err := execInAgentPod(ctx, t, infra.namespace, sb.Name, "python3", "-c", probeScript)
+	if err != nil || !strings.Contains(stdout, "H2_AND_UDP_OK") {
+		t.Fatalf("HTTP/2 + connect-udp probe failed: err=%v\nstdout=%s\nstderr=%s", err, stdout, stderr)
+	}
+
+	recs := fetchUpstreamRecords(ctx, t, infra)
+	var h2Allow, h2Deny, udpAllow int
+	for _, r := range recs {
+		switch {
+		case r.Transport == "tcp" && r.Protocol == "HTTP/2.0" && r.Decision == "allow":
+			h2Allow++
+		case r.Transport == "tcp" && r.Protocol == "HTTP/2.0" && r.Decision == "deny":
+			h2Deny++
+		case r.Transport == "udp" && r.Decision == "allow":
+			udpAllow++
+		}
+	}
+	if h2Allow < 2 || h2Deny < 1 || udpAllow < 1 {
+		t.Fatalf("expected >=2 H2 allows, >=1 H2 deny, >=1 UDP allow; got h2Allow=%d h2Deny=%d udpAllow=%d records=%+v",
+			h2Allow, h2Deny, udpAllow, recs)
+	}
+
+	// All 3 TCP requests multiplexed on 1 HTTP/2 TLS conn + 1 HTTP/1.1 TLS conn for connect-udp.
+	stats := fetchUpstreamStats(ctx, t, infra)
+	if stats.TLSConnections > 2 {
+		t.Fatalf("expected HTTP/2 connection multiplexing (<= 2 TLS connections for 3 TCP + 1 UDP), got %d", stats.TLSConnections)
+	}
+}
+
+// TestSandboxNetClusterTrustBundleAndMountOnly validates:
+//   - Kubernetes ClusterTrustBundle (KEP-3257) by exact name for upstream.tls.caCertificateRefs
+//   - ClusterTrustBundle by signerName + labelSelector for caTrust.sources
+//   - caTrust.mode=MountOnly mounts /var/run/agent-ca.pem WITHOUT injecting CA env vars
+func TestSandboxNetClusterTrustBundleAndMountOnly(t *testing.T) {
+	tc := framework.NewTestContext(t)
+	ctx := t.Context()
+	ensureSandboxNetDeployed(t, tc)
+	infra := deployTestInfra(t, tc, "snet-ctb", testUpstreamOpts{})
+
+	const signerName = "sandbox-net.e2e.test/ca"
+	destCTB := &certificatesv1beta1.ClusterTrustBundle{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   fmt.Sprintf("sandbox-net.e2e.test:ca:%s", infra.namespace),
+			Labels: map[string]string{"e2e-run": infra.namespace},
+		},
+		Spec: certificatesv1beta1.ClusterTrustBundleSpec{
+			SignerName:  signerName,
+			TrustBundle: string(infra.destPKI.caCertPEM),
+		},
+	}
+	upstreamCTB := &certificatesv1beta1.ClusterTrustBundle{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: fmt.Sprintf("e2e-upstream-%s", infra.namespace),
+		},
+		Spec: certificatesv1beta1.ClusterTrustBundleSpec{
+			TrustBundle: string(infra.upstreamPKI.caCertPEM),
+		},
+	}
+	if err := tc.CreateWithCleanup(ctx, destCTB); err != nil {
+		t.Fatalf("create dest ClusterTrustBundle: %v", err)
+	}
+	if err := tc.CreateWithCleanup(ctx, upstreamCTB); err != nil {
+		t.Fatalf("create upstream ClusterTrustBundle: %v", err)
+	}
+
+	sb := &sandboxv1beta1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "sb-ctb-mountonly",
+			Namespace: infra.namespace,
+		},
+		Spec: sandboxv1beta1.SandboxSpec{
+			SandboxBlueprint: sandboxv1beta1.SandboxBlueprint{
+				PodTemplate: pythonWorkloadPodTemplate(),
+				Network: &sandboxv1beta1.SandboxNetworkSpec{
+					ConfinementMode: sandboxv1beta1.SandboxConfinementModeNetworkPolicyDenyAll,
+					AdapterMode:     sandboxv1beta1.SandboxAdapterModeExplicitProxy,
+					Upstream: &sandboxv1beta1.SandboxNetworkUpstream{
+						Address: infra.upstreamAddr,
+						TLS: &sandboxv1beta1.SandboxUpstreamTLS{
+							CACertificateRefs: []sandboxv1beta1.SandboxCASource{
+								{
+									Type: sandboxv1beta1.SandboxCASourceTypeClusterTrustBundle,
+									ClusterTrustBundle: &sandboxv1beta1.SandboxClusterTrustBundleRef{
+										Name: upstreamCTB.Name,
+									},
+								},
+							},
+						},
+					},
+					CATrust: &sandboxv1beta1.SandboxCATrustSpec{
+						Mode:       sandboxv1beta1.SandboxCATrustModeMountOnly,
+						BundleMode: sandboxv1beta1.SandboxCABundleModeAppendSystemRoots,
+						Sources: []sandboxv1beta1.SandboxCASource{
+							{
+								Type: sandboxv1beta1.SandboxCASourceTypeClusterTrustBundle,
+								ClusterTrustBundle: &sandboxv1beta1.SandboxClusterTrustBundleRef{
+									SignerName: signerName,
+									LabelSelector: &metav1.LabelSelector{
+										MatchLabels: map[string]string{"e2e-run": infra.namespace},
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	if err := tc.CreateWithCleanup(ctx, sb); err != nil {
+		t.Fatalf("create Sandbox: %v", err)
+	}
+	tc.MustWaitForObject(sb, predicates.ReadyConditionIsTrue)
+
+	probeScript := fmt.Sprintf(`
+import json, os, ssl, urllib.error, urllib.request
+
+# 1. MountOnly must NOT inject any CA env vars.
+for k in ("AGENT_CA_CERT", "SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE", "NODE_EXTRA_CA_CERTS", "PIP_CERT"):
+    assert k not in os.environ, f"MountOnly unexpectedly injected {k}={os.environ[k]!r}"
+
+# 2. Bundle files must still be mounted cleanly.
+merged = open("/var/run/agent-ca.pem", "r").read()
+assert "BEGIN CERTIFICATE" in merged and "PRIVATE KEY" not in merged
+
+# 3. Default HTTPS fails cert verification because SSL_CERT_FILE is not injected.
+failed_default = False
+try:
+    urllib.request.urlopen("https://%s:8443/must-fail", timeout=10)
+except (ssl.SSLError, urllib.error.URLError):
+    failed_default = True
+assert failed_default, "default HTTPS unexpectedly succeeded under MountOnly without SSL_CERT_FILE"
+
+# 4. Explicit cafile=/var/run/agent-ca.pem succeeds using the ClusterTrustBundle CA.
+ctx = ssl.create_default_context(cafile="/var/run/agent-ca.pem")
+body = json.loads(urllib.request.urlopen("https://%s:8443/mount-only-ok", context=ctx, timeout=10).read().decode())
+assert body["path"] == "/mount-only-ok", f"unexpected body: {body}"
+print("CTB_MOUNT_ONLY_OK")
+`, infra.destFQDN, infra.destFQDN)
+
+	stdout, stderr, err := execInAgentPod(ctx, t, infra.namespace, sb.Name, "python3", "-c", probeScript)
+	if err != nil || !strings.Contains(stdout, "CTB_MOUNT_ONLY_OK") {
+		t.Fatalf("ClusterTrustBundle + MountOnly probe failed: err=%v\nstdout=%s\nstderr=%s", err, stdout, stderr)
 	}
 }

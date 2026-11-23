@@ -19,8 +19,11 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"flag"
+	"fmt"
 	"net/http"
 	"os"
 	"os/signal"
@@ -37,6 +40,7 @@ import (
 	"sigs.k8s.io/agent-sandbox/packages/sandbox-net/pkg/auth"
 	"sigs.k8s.io/agent-sandbox/packages/sandbox-net/pkg/catrust"
 	"sigs.k8s.io/agent-sandbox/packages/sandbox-net/pkg/driver"
+	"sigs.k8s.io/agent-sandbox/packages/sandbox-net/pkg/ingress"
 	"sigs.k8s.io/agent-sandbox/packages/sandbox-net/pkg/store"
 	"sigs.k8s.io/agent-sandbox/packages/sandbox-net/pkg/tunnel"
 )
@@ -56,6 +60,10 @@ func main() {
 		spireDelegatedSock string
 		systemRootsPath    string
 		metricsAddr        string
+		ingressAddr        string
+		ingressTLSCert     string
+		ingressTLSKey      string
+		ingressClientCA    string
 		maxSandboxes       int64
 	)
 
@@ -73,6 +81,10 @@ func main() {
 	flag.StringVar(&spireDelegatedSock, "spire-delegated-socket", auth.DefaultSPIREDelegatedSocket, "SPIRE Delegated Identity Unix socket path")
 	flag.StringVar(&systemRootsPath, "system-roots-path", "", "Optional host system CA bundle path for AppendSystemRoots mode (auto-detected if empty)")
 	flag.StringVar(&metricsAddr, "metrics-addr", ":9102", "Address for Prometheus /metrics and /healthz")
+	flag.StringVar(&ingressAddr, "ingress-addr", "", "Optional host listen address for the HTTP CONNECT ingress bridge (e.g. :15080)")
+	flag.StringVar(&ingressTLSCert, "ingress-tls-cert", "", "Optional PEM server certificate path for TLS on --ingress-addr")
+	flag.StringVar(&ingressTLSKey, "ingress-tls-key", "", "Optional PEM server key path for TLS on --ingress-addr")
+	flag.StringVar(&ingressClientCA, "ingress-client-ca", "", "Optional PEM client CA bundle path to enforce mTLS on --ingress-addr")
 	flag.Int64Var(&maxSandboxes, "max-sandboxes", 0, "Per-node DRA slot count (0 auto-detects from node status.allocatable.pods, fallback 110)")
 	flag.Parse()
 
@@ -117,17 +129,39 @@ func main() {
 	}
 	defer tunnelMgr.Close()
 
+	var ingressSrv *ingress.Server
+	if ingressAddr != "" {
+		ingressTLS, err := buildIngressTLSConfig(ingressTLSCert, ingressTLSKey, ingressClientCA)
+		if err != nil {
+			klog.Fatalf("configure ingress TLS: %v", err)
+		}
+		ingressSrv, err = ingress.NewServer(ingress.Config{
+			ListenAddr: ingressAddr,
+			Store:      podStore,
+			TLSConfig:  ingressTLS,
+		})
+		if err != nil {
+			klog.Fatalf("create ingress bridge: %v", err)
+		}
+		if _, err := ingressSrv.Start(); err != nil {
+			klog.Fatalf("start ingress bridge: %v", err)
+		}
+		defer func() { _ = ingressSrv.Close() }()
+	}
+
 	drv, err := driver.New(driver.Config{
-		DriverName:     driverName,
-		NodeName:       nodeName,
-		KubeClient:     kubeClient,
-		Store:          podStore,
-		Tunnel:         tunnelMgr,
-		CAMaterializer: catrust.NewMaterializer(kubeClient, systemRootsPath),
-		MaxSandboxes:   maxSandboxes,
-		KubeletRootDir: kubeletRoot,
-		NRISocketPath:  nriSocket,
-		NRIPluginIdx:   nriPluginIdx,
+		DriverName:        driverName,
+		NodeName:          nodeName,
+		KubeClient:        kubeClient,
+		Store:             podStore,
+		Tunnel:            tunnelMgr,
+		Ingress:           ingressSrv,
+		CAMaterializer:    catrust.NewMaterializer(kubeClient, systemRootsPath),
+		MaxSandboxes:      maxSandboxes,
+		KubeletRootDir:    kubeletRoot,
+		NRISocketPath:     nriSocket,
+		NRIPluginIdx:      nriPluginIdx,
+		IngressBridgeAddr: ingressAddr,
 	})
 	if err != nil {
 		klog.Fatalf("create DRA+NRI driver: %v", err)
@@ -171,4 +205,34 @@ func loadRestConfig(kubeconfig string) (*rest.Config, error) {
 	}
 	loadingRules := clientcmd.NewDefaultClientConfigLoadingRules()
 	return clientcmd.NewNonInteractiveDeferredLoadingClientConfig(loadingRules, &clientcmd.ConfigOverrides{}).ClientConfig()
+}
+
+func buildIngressTLSConfig(certFile, keyFile, clientCAFile string) (*tls.Config, error) {
+	if certFile == "" && keyFile == "" && clientCAFile == "" {
+		return nil, nil
+	}
+	if certFile == "" || keyFile == "" {
+		return nil, errors.New("both --ingress-tls-cert and --ingress-tls-key are required when TLS is enabled")
+	}
+	pair, err := tls.LoadX509KeyPair(certFile, keyFile)
+	if err != nil {
+		return nil, fmt.Errorf("load ingress TLS keypair: %w", err)
+	}
+	cfg := &tls.Config{
+		MinVersion:   tls.VersionTLS12,
+		Certificates: []tls.Certificate{pair},
+	}
+	if clientCAFile != "" {
+		caBytes, err := os.ReadFile(clientCAFile)
+		if err != nil {
+			return nil, fmt.Errorf("read ingress client CA %q: %w", clientCAFile, err)
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(caBytes) {
+			return nil, fmt.Errorf("no valid CA certificates in %q", clientCAFile)
+		}
+		cfg.ClientCAs = pool
+		cfg.ClientAuth = tls.RequireAndVerifyClientCert
+	}
+	return cfg, nil
 }

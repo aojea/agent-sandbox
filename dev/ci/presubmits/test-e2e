@@ -46,6 +46,7 @@ class E2ETestRunner(TestRunner):
                 "sandbox-router",
                 "sandbox-router-go",
                 "sandbox-net",
+                "sandbox-net-test-upstream",
                 "sandboxd",
                 "python-runtime-sandbox",
                 "chrome-sandbox",

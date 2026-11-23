@@ -25,7 +25,55 @@ import (
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
 )
+
+const secretCertReloadTTL = 30 * time.Second
+
+// secretPairLoader caches a TLS keypair from a Kubernetes Secret and refreshes it
+// periodically so cert-manager Secret rotations take effect without restarting Pods.
+type secretPairLoader struct {
+	kubeClient kubernetes.Interface
+	namespace  string
+	name       string
+
+	mu        sync.Mutex
+	cert      *tls.Certificate
+	fetchedAt time.Time
+}
+
+func (l *secretPairLoader) GetClientCertificate(_ *tls.CertificateRequestInfo) (*tls.Certificate, error) {
+	l.mu.Lock()
+	if l.cert != nil && time.Since(l.fetchedAt) < secretCertReloadTTL {
+		c := l.cert
+		l.mu.Unlock()
+		return c, nil
+	}
+	l.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	secret, err := l.kubeClient.CoreV1().Secrets(l.namespace).Get(ctx, l.name, metav1.GetOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("get mTLS Secret %s/%s: %w", l.namespace, l.name, err)
+	}
+	certPEM := secret.Data["tls.crt"]
+	keyPEM := secret.Data["tls.key"]
+	if len(certPEM) == 0 || len(keyPEM) == 0 {
+		return nil, fmt.Errorf("mTLS Secret %s/%s must contain tls.crt and tls.key", l.namespace, secret.Name)
+	}
+	pair, err := tls.X509KeyPair(certPEM, keyPEM)
+	if err != nil {
+		return nil, fmt.Errorf("parse mTLS Secret %s/%s keypair: %w", l.namespace, secret.Name, err)
+	}
+
+	l.mu.Lock()
+	l.cert = &pair
+	l.fetchedAt = time.Now()
+	c := l.cert
+	l.mu.Unlock()
+	return c, nil
+}
 
 // rotatingPairLoader caches a TLS keypair loaded from certPath and keyPath,
 // reloading automatically when either file's modification time or size changes.
@@ -104,20 +152,16 @@ func (r *Resolver) resolveMTLS(ctx context.Context, req ResolveRequest) (*Client
 		if r.kubeClient == nil {
 			return nil, errors.New("kubernetes client is required to read mtls.secretRef")
 		}
-		secret, err := r.kubeClient.CoreV1().Secrets(req.PodNamespace).Get(ctx, mtlsSpec.SecretRef.Name, metav1.GetOptions{})
-		if err != nil {
-			return nil, fmt.Errorf("get mTLS Secret %s/%s: %w", req.PodNamespace, mtlsSpec.SecretRef.Name, err)
+		loader := &secretPairLoader{
+			kubeClient: r.kubeClient,
+			namespace:  req.PodNamespace,
+			name:       mtlsSpec.SecretRef.Name,
 		}
-		certPEM := secret.Data["tls.crt"]
-		keyPEM := secret.Data["tls.key"]
-		if len(certPEM) == 0 || len(keyPEM) == 0 {
-			return nil, fmt.Errorf("mTLS Secret %s/%s must contain tls.crt and tls.key", req.PodNamespace, secret.Name)
+		// Validate eagerly so broken Secret references fail fast during PrepareResourceClaims.
+		if _, err := loader.GetClientCertificate(nil); err != nil {
+			return nil, err
 		}
-		pair, err := tls.X509KeyPair(certPEM, keyPEM)
-		if err != nil {
-			return nil, fmt.Errorf("parse mTLS Secret %s/%s keypair: %w", req.PodNamespace, secret.Name, err)
-		}
-		tlsCfg.Certificates = []tls.Certificate{pair}
+		tlsCfg.GetClientCertificate = loader.GetClientCertificate
 		return &ClientConfig{
 			AuthMode:  AuthModeMTLS,
 			TLSConfig: tlsCfg,

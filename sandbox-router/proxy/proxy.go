@@ -23,6 +23,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -337,8 +338,22 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		upstreamURL.RawPath = r.URL.EscapedPath()
 	}
 	upstreamURL.RawQuery = outboundRawQuery
+	var ingressTarget *sandboxNetIngressTarget
+	if h.cfg.SandboxNetIngressPort > 0 && resolved.UsesSandboxNet && resolved.HostIP != "" && resolved.PodUID != "" {
+		// Route sandbox-net Pods through the node-local HTTP CONNECT ingress bridge.
+		// Keying upstreamURL.Host by PodUID isolates http.Transport connection pools per Pod.
+		upstreamURL.Host = net.JoinHostPort(string(resolved.PodUID)+".sandbox-net.local", strconv.Itoa(target0.Port))
+		ingressTarget = &sandboxNetIngressTarget{
+			BridgeAddr: net.JoinHostPort(resolved.HostIP, strconv.Itoa(h.cfg.SandboxNetIngressPort)),
+			PodUID:     string(resolved.PodUID),
+			Port:       target0.Port,
+		}
+	}
 	rp := &httputil.ReverseProxy{
 		Rewrite: func(pr *httputil.ProxyRequest) {
+			if ingressTarget != nil {
+				pr.Out = pr.Out.WithContext(withSandboxNetIngressTarget(pr.Out.Context(), *ingressTarget))
+			}
 			pr.Out.URL = upstreamURL
 			// Clear inbound Host so net/http picks the URL host. Matches the
 			// Python router's behavior of stripping Host before forwarding.
@@ -421,6 +436,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		Transport:     h.transport,
 		FlushInterval: -1, // immediate flush for SSE / streaming responses
 		ErrorHandler: func(w http.ResponseWriter, errReq *http.Request, err error) {
+			if denied, ok := errors.AsType[*sandboxNetIngressDeniedError](err); ok {
+				h.recordUpstreamErrorReason(target0.Namespace, "ingress_denied")
+				writeProxyError(w, errReq, kind, &Error{
+					Status: denied.Status,
+					Detail: denied.Error(),
+				})
+				return
+			}
 			var bodyLimit *http.MaxBytesError
 			if grpcRequest && errors.As(err, &bodyLimit) {
 				writeProxyError(w, errReq, kind, &Error{
@@ -597,11 +620,16 @@ func isUpgradeRequest(r *http.Request) bool {
 // in the worst case Pod-IP traffic leaves the cluster. Defaulting to
 // no proxy makes "router goes direct to the sandbox" the guarantee.
 func defaultTransport(cfg *config.Config) *http.Transport {
+	baseDial := (&net.Dialer{
+		Timeout:   30 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}).DialContext
+	dialFn := baseDial
+	if cfg != nil && cfg.SandboxNetIngressPort > 0 {
+		dialFn = wrapSandboxNetDialer(baseDial, cfg)
+	}
 	return &http.Transport{
-		DialContext: (&net.Dialer{
-			Timeout:   30 * time.Second,
-			KeepAlive: 30 * time.Second,
-		}).DialContext,
+		DialContext:           dialFn,
 		ForceAttemptHTTP2:     false,
 		MaxIdleConns:          200,
 		MaxIdleConnsPerHost:   16,

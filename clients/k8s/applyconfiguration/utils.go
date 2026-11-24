@@ -44,8 +44,38 @@ func ForKind(kind schema.GroupVersionKind) interface{} {
 		return &apiv1beta1.SandboxApplyConfiguration{}
 	case v1beta1.SchemeGroupVersion.WithKind("SandboxBlueprint"):
 		return &apiv1beta1.SandboxBlueprintApplyConfiguration{}
+	case v1beta1.SchemeGroupVersion.WithKind("SandboxCASource"):
+		return &apiv1beta1.SandboxCASourceApplyConfiguration{}
+	case v1beta1.SchemeGroupVersion.WithKind("SandboxCATrustSpec"):
+		return &apiv1beta1.SandboxCATrustSpecApplyConfiguration{}
+	case v1beta1.SchemeGroupVersion.WithKind("SandboxClusterTrustBundleRef"):
+		return &apiv1beta1.SandboxClusterTrustBundleRefApplyConfiguration{}
+	case v1beta1.SchemeGroupVersion.WithKind("SandboxConfigMapKeyRef"):
+		return &apiv1beta1.SandboxConfigMapKeyRefApplyConfiguration{}
+	case v1beta1.SchemeGroupVersion.WithKind("SandboxIngressPort"):
+		return &apiv1beta1.SandboxIngressPortApplyConfiguration{}
+	case v1beta1.SchemeGroupVersion.WithKind("SandboxMTLSAuth"):
+		return &apiv1beta1.SandboxMTLSAuthApplyConfiguration{}
+	case v1beta1.SchemeGroupVersion.WithKind("SandboxNetworkParameter"):
+		return &apiv1beta1.SandboxNetworkParameterApplyConfiguration{}
+	case v1beta1.SchemeGroupVersion.WithKind("SandboxNetworkSpec"):
+		return &apiv1beta1.SandboxNetworkSpecApplyConfiguration{}
+	case v1beta1.SchemeGroupVersion.WithKind("SandboxPEPAuth"):
+		return &apiv1beta1.SandboxPEPAuthApplyConfiguration{}
+	case v1beta1.SchemeGroupVersion.WithKind("SandboxPEPTLS"):
+		return &apiv1beta1.SandboxPEPTLSApplyConfiguration{}
+	case v1beta1.SchemeGroupVersion.WithKind("SandboxPodCertificateAuth"):
+		return &apiv1beta1.SandboxPodCertificateAuthApplyConfiguration{}
+	case v1beta1.SchemeGroupVersion.WithKind("SandboxPolicyEnforcementPoint"):
+		return &apiv1beta1.SandboxPolicyEnforcementPointApplyConfiguration{}
+	case v1beta1.SchemeGroupVersion.WithKind("SandboxSecretKeyRef"):
+		return &apiv1beta1.SandboxSecretKeyRefApplyConfiguration{}
+	case v1beta1.SchemeGroupVersion.WithKind("SandboxServiceAccountTokenAuth"):
+		return &apiv1beta1.SandboxServiceAccountTokenAuthApplyConfiguration{}
 	case v1beta1.SchemeGroupVersion.WithKind("SandboxSpec"):
 		return &apiv1beta1.SandboxSpecApplyConfiguration{}
+	case v1beta1.SchemeGroupVersion.WithKind("SandboxSPIFFEAuth"):
+		return &apiv1beta1.SandboxSPIFFEAuthApplyConfiguration{}
 	case v1beta1.SchemeGroupVersion.WithKind("SandboxStatus"):
 		return &apiv1beta1.SandboxStatusApplyConfiguration{}
 

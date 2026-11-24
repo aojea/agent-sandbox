@@ -70,8 +70,8 @@ _Appears in:_
 
 | Field | Description | Default | Validation |
 | --- | --- | --- | --- |
-| `shutdownTime` _[Time](https://kubernetes.io/docs/reference/generated/kubernetes-api/v/#time-v1-meta)_ | shutdownTime is the absolute time at which the Sandbox expires. When the current<br />time reaches shutdownTime, the controller tears down the underlying resources<br />(Pod and Service) and then applies shutdownPolicy to the Sandbox object itself.<br />If unset, the Sandbox never expires and lives until it is explicitly deleted. |  | Format: date-time <br />Optional: \{\} <br /> |
-| `shutdownPolicy` _[ShutdownPolicy](#shutdownpolicy)_ | shutdownPolicy determines what happens to the Sandbox object itself when it expires<br />(i.e. when shutdownTime is reached). The underlying resources (Pod, Service) are<br />always deleted on expiry regardless of this policy; shutdownPolicy governs only the<br />Sandbox object:<br />  - Retain (default): the Sandbox object is kept after its resources are torn down.<br />    Its live status fields are cleared and a Ready=False condition with reason<br />    SandboxExpired is set so the expiry is observable.<br />  - Delete: the Sandbox object is deleted once its underlying resources are removed.<br />This field has no effect while shutdownTime is unset, since the Sandbox never expires. | Retain | Enum: [Delete Retain] <br />Optional: \{\} <br /> |
+| `shutdownTime` _[Time](https://kubernetes.io/docs/reference/generated/kubernetes-api/v/#time-v1-meta)_ | shutdownTime is the absolute time at which the Sandbox expires. When the current<br />time reaches shutdownTime, the controller tears down the underlying resources<br />(Pod, Service, and any owned ResourceClaim and NetworkPolicy) and then applies<br />shutdownPolicy to the Sandbox object itself.<br />If unset, the Sandbox never expires and lives until it is explicitly deleted. |  | Format: date-time <br />Optional: \{\} <br /> |
+| `shutdownPolicy` _[ShutdownPolicy](#shutdownpolicy)_ | shutdownPolicy determines what happens to the Sandbox object itself when it expires<br />(i.e. when shutdownTime is reached). The underlying resources (Pod, Service, and any<br />owned ResourceClaim and NetworkPolicy) are always deleted on expiry regardless of this<br />policy; shutdownPolicy governs only the Sandbox object:<br />  - Retain (default): the Sandbox object is kept after its resources are torn down.<br />    Its live status fields are cleared and a Ready=False condition with reason<br />    SandboxExpired is set so the expiry is observable.<br />  - Delete: the Sandbox object is deleted once its underlying resources are removed.<br />This field has no effect while shutdownTime is unset, since the Sandbox never expires. | Retain | Enum: [Delete Retain] <br />Optional: \{\} <br /> |
 
 
 #### PersistentVolumeClaimTemplate
@@ -171,6 +171,262 @@ _Appears in:_
 | `volumeClaimTemplates` _[PersistentVolumeClaimTemplate](#persistentvolumeclaimtemplate) array_ | volumeClaimTemplates is a list of claims that the sandbox pod is allowed to reference.<br />When creating a sandbox, PVCs will be created from these templates.<br />Every claim in this list must have at least one matching access mode with a provisioner volume.<br />Each PVC is named after the template and the Sandbox, joined by a hyphen, and is owned<br />by the Sandbox. It is kept while the Sandbox is suspended or retained after expiry, so a<br />resumed Pod reattaches it with its data. It is garbage collected when the Sandbox<br />object is deleted.<br />On a Sandbox this list is immutable after creation.<br />NOTE: This list is atomic. Updates to this field will replace the entire list rather than merging with existing entries.<br />Each entry must have a unique, non-empty metadata.name.<br />At most 128 entries: the cap only bounds the CEL cost of the uniqueness rule. |  | MaxItems: 128 <br />Optional: \{\} <br /> |
 | `service` _boolean_ | service controls whether the controller should automatically create a<br />headless Service for the Sandbox workload.<br />When unset, the controller preserves existing Services for backward<br />compatibility but does not create new ones. Set to true to enable or false<br />to explicitly disable and remove the Service. |  | Optional: \{\} <br /> |
 | `failedPodPolicy` _[FailedPodPolicy](#failedpodpolicy)_ | failedPodPolicy controls what happens when the backing Pod enters phase Failed.<br />Retain (default): leave the Failed pod and surface Finished=True.<br />Recreate: delete the controller-owned Failed pod so a new one is created;<br />the Sandbox identity and any Sandbox-owned PVCs are retained.<br />Combined with restartPolicy Never and a container that always exits non-zero,<br />Recreate can recreate the Pod repeatedly; the controller applies Deployment-style<br />in-memory exponential backoff (5s, doubling up to 5m) between creates so a crash<br />loop cannot hot-loop the API server. Backoff resets after the replacement Pod has<br />been continuously observed Running for 10 minutes. Backoff state is not persisted<br />in status. | Retain | Enum: [Retain Recreate] <br />Optional: \{\} <br /> |
+| `network` _[SandboxNetworkSpec](#sandboxnetworkspec)_ | network configures isolated traffic plumbing via a Kubernetes Network Driver (DRA and NRI).<br />When set, the controller creates a ResourceClaim for the configured driverName (defaulting<br />to dra.agents.net), embeds the network stanza in OpaqueDeviceConfiguration, wires Pod<br />confinement, and delegates policy enforcement and credential injection to the configured<br />Policy Enforcement Point (PEP). |  | Optional: \{\} <br /> |
+
+
+#### SandboxCABundleMode
+
+_Underlying type:_ _string_
+
+SandboxCABundleMode defines whether Pod CA certificates are merged with system root CAs
+or replace the root trust store completely.
+
+_Validation:_
+- Enum: [AppendSystemRoots Replace]
+
+_Appears in:_
+- [SandboxCATrustSpec](#sandboxcatrustspec)
+
+| Field | Description |
+| --- | --- |
+| `AppendSystemRoots` | SandboxCABundleModeAppendSystemRoots merges standard system root CAs with the configured<br />custom CA certificates in /var/run/agent-ca.pem so pass-through HTTPS destinations remain<br />trusted while NODE_EXTRA_CA_CERTS receives the custom-only /var/run/agent-extra-ca.pem.<br /> |
+| `Replace` | SandboxCABundleModeReplace writes only the configured custom CA certificates to<br />/var/run/agent-ca.pem without appending system root CAs.<br /> |
+
+
+#### SandboxCASource
+
+
+
+SandboxCASource defines one CA certificate bundle source following Kubernetes,
+cert-manager, trust-manager, and Gateway API conventions.
+
+
+
+_Appears in:_
+- [SandboxCATrustSpec](#sandboxcatrustspec)
+- [SandboxPEPTLS](#sandboxpeptls)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `type` _[SandboxCASourceType](#sandboxcasourcetype)_ | type selects the CA bundle source: ConfigMap, Secret, ClusterTrustBundle, or HostPath. |  | Enum: [ConfigMap Secret ClusterTrustBundle HostPath] <br />Required: \{\} <br /> |
+| `configMapRef` _[SandboxConfigMapKeyRef](#sandboxconfigmapkeyref)_ | configMapRef references a ConfigMap key containing PEM CA certificates. |  | Optional: \{\} <br /> |
+| `secretRef` _[SandboxSecretKeyRef](#sandboxsecretkeyref)_ | secretRef references a Secret key containing PEM CA certificates (for example,<br />ca.crt on a cert-manager kubernetes.io/tls Secret). |  | Optional: \{\} <br /> |
+| `clusterTrustBundle` _[SandboxClusterTrustBundleRef](#sandboxclustertrustbundleref)_ | clusterTrustBundle references Kubernetes ClusterTrustBundle object(s). |  | Optional: \{\} <br /> |
+| `hostPath` _string_ | hostPath references a PEM CA bundle file on the node filesystem. |  | MaxLength: 512 <br />Pattern: `^/.*` <br />Optional: \{\} <br /> |
+
+
+#### SandboxCASourceType
+
+_Underlying type:_ _string_
+
+SandboxCASourceType selects the source of a PEM CA certificate bundle.
+
+_Validation:_
+- Enum: [ConfigMap Secret ClusterTrustBundle HostPath]
+
+_Appears in:_
+- [SandboxCASource](#sandboxcasource)
+
+| Field | Description |
+| --- | --- |
+| `ConfigMap` | SandboxCASourceTypeConfigMap reads PEM CA certificates from a ConfigMap in the Sandbox namespace<br />(for example, kube-root-ca.crt or a trust-manager Bundle ConfigMap).<br /> |
+| `Secret` | SandboxCASourceTypeSecret reads PEM CA certificates from a Secret in the Sandbox namespace<br />(for example, ca.crt in a cert-manager kubernetes.io/tls Secret or trust-manager Bundle Secret).<br />Only valid CERTIFICATE PEM blocks are extracted; private keys are never mounted into the Pod.<br /> |
+| `ClusterTrustBundle` | SandboxCASourceTypeClusterTrustBundle reads PEM CA certificates from Kubernetes<br />certificates.k8s.io/v1beta1 ClusterTrustBundle objects (KEP-3257).<br /> |
+| `HostPath` | SandboxCASourceTypeHostPath reads PEM CA certificates from a node-local filesystem path.<br /> |
+
+
+#### SandboxCATrustMode
+
+_Underlying type:_ _string_
+
+SandboxCATrustMode controls how Pod CA certificates are exposed to workload containers.
+
+_Validation:_
+- Enum: [None MountOnly InjectEnv]
+
+_Appears in:_
+- [SandboxCATrustSpec](#sandboxcatrustspec)
+
+| Field | Description |
+| --- | --- |
+| `None` | SandboxCATrustModeNone disables mounting custom CA certificates into workload containers.<br /> |
+| `MountOnly` | SandboxCATrustModeMountOnly mounts the CA bundle files read-only at /var/run/agent-ca.pem<br />and /var/run/agent-extra-ca.pem without setting runtime environment variables.<br /> |
+| `InjectEnv` | SandboxCATrustModeInjectEnv mounts the CA bundle files and injects AGENT_CA_CERT plus<br />language-specific CA trust environment variables (SSL_CERT_FILE, REQUESTS_CA_BUNDLE,<br />PIP_CERT, CURL_CA_BUNDLE, GIT_SSL_CAINFO, NODE_EXTRA_CA_CERTS, NPM_CONFIG_CAFILE,<br />DENO_CERT, CARGO_HTTP_CAINFO, AWS_CA_BUNDLE, CLOUDSDK_CORE_CUSTOM_CA_CERTS_FILE).<br /> |
+
+
+#### SandboxCATrustSpec
+
+
+
+SandboxCATrustSpec defines Pod-scoped CA certificates mounted into workload containers
+per the agents.net specification (AGENT_CA_CERT) along with language runtime trust env vars.
+
+
+
+_Appears in:_
+- [SandboxNetworkSpec](#sandboxnetworkspec)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `mode` _[SandboxCATrustMode](#sandboxcatrustmode)_ | mode controls whether CA bundles are ignored, mounted only, or mounted with language<br />trust environment variables injected. Defaults to InjectEnv when caTrust is configured. | InjectEnv | Enum: [None MountOnly InjectEnv] <br />Optional: \{\} <br /> |
+| `bundleMode` _[SandboxCABundleMode](#sandboxcabundlemode)_ | bundleMode controls whether custom CA certificates are appended to system root CAs<br />(AppendSystemRoots, default) or replace the root trust store (Replace). | AppendSystemRoots | Enum: [AppendSystemRoots Replace] <br />Optional: \{\} <br /> |
+| `sources` _[SandboxCASource](#sandboxcasource) array_ | sources lists one or more PEM CA bundle sources to merge into the Pod's CA bundle. |  | MaxItems: 16 <br />Optional: \{\} <br /> |
+
+
+#### SandboxClusterTrustBundleRef
+
+
+
+SandboxClusterTrustBundleRef selects one or more Kubernetes ClusterTrustBundle objects
+by exact name or by signerName and optional labelSelector.
+
+
+
+_Appears in:_
+- [SandboxCASource](#sandboxcasource)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `name` _string_ | name selects a single ClusterTrustBundle object by name. |  | MaxLength: 253 <br />Optional: \{\} <br /> |
+| `signerName` _string_ | signerName selects all ClusterTrustBundle objects issued for this signerName<br />matching labelSelector. |  | MaxLength: 253 <br />Optional: \{\} <br /> |
+| `labelSelector` _[LabelSelector](https://kubernetes.io/docs/reference/generated/kubernetes-api/v/#labelselector-v1-meta)_ | labelSelector optionally filters ClusterTrustBundle objects when signerName is set. |  | Optional: \{\} <br /> |
+
+
+#### SandboxConfigMapKeyRef
+
+
+
+SandboxConfigMapKeyRef selects a key inside a ConfigMap in the Sandbox namespace.
+
+
+
+_Appears in:_
+- [SandboxCASource](#sandboxcasource)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `name` _string_ | name is the ConfigMap name in the Sandbox namespace. |  | MaxLength: 253 <br />MinLength: 1 <br />Required: \{\} <br /> |
+| `key` _string_ | key is the ConfigMap data key containing PEM-encoded certificates. Defaults to ca.crt. | ca.crt | MaxLength: 253 <br />Optional: \{\} <br /> |
+
+
+#### SandboxConfinementMode
+
+_Underlying type:_ _string_
+
+SandboxConfinementMode defines how the backing Pod is isolated from direct cluster and
+internet network egress so that all traffic traverses the configured Policy Enforcement Point (PEP).
+
+_Validation:_
+- Enum: [PodNetworkIsolated NetworkPolicyDenyAll]
+
+_Appears in:_
+- [SandboxNetworkSpec](#sandboxnetworkspec)
+
+| Field | Description |
+| --- | --- |
+| `PodNetworkIsolated` | SandboxConfinementModePodNetworkIsolated places the Pod in a loopback-only network<br />namespace (KEP-6313) with no CNI attachment and no Pod IP. The network driver verifies<br />that only loopback exists before any container starts.<br /> |
+| `NetworkPolicyDenyAll` | SandboxConfinementModeNetworkPolicyDenyAll runs on standard CNI clusters without<br />KEP-6313. The controller applies a deny-all NetworkPolicy and the network driver<br />prevents non-loopback direct egress before any container starts.<br /> |
+
+
+#### SandboxIngressPort
+
+
+
+SandboxIngressPort declares a container port exposed over the agents.net ingress tunnel.
+
+
+
+_Appears in:_
+- [SandboxNetworkSpec](#sandboxnetworkspec)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `port` _integer_ | port is the TCP or UDP port number inside the sandbox Pod. |  | Maximum: 65535 <br />Minimum: 1 <br />Required: \{\} <br /> |
+| `protocol` _[SandboxIngressProtocol](#sandboxingressprotocol)_ | protocol is the transport protocol for this port. Defaults to TCP.<br />Note that UDP ingress forwarding is driver-dependent (dra-agents-net's HTTP/1.1<br />CONNECT ingress bridge forwards TCP ports only). | TCP | Enum: [TCP UDP] <br />Optional: \{\} <br /> |
+
+
+#### SandboxIngressProtocol
+
+_Underlying type:_ _string_
+
+SandboxIngressProtocol defines the transport protocol for an explicit ingress port.
+
+_Validation:_
+- Enum: [TCP UDP]
+
+_Appears in:_
+- [SandboxIngressPort](#sandboxingressport)
+
+| Field | Description |
+| --- | --- |
+| `TCP` | SandboxIngressProtocolTCP forwards TCP ingress traffic.<br /> |
+| `UDP` | SandboxIngressProtocolUDP forwards UDP ingress traffic.<br /> |
+
+
+#### SandboxMTLSAuth
+
+
+
+SandboxMTLSAuth configures client certificate mTLS authentication to the Policy Enforcement Point (PEP).
+
+
+
+_Appears in:_
+- [SandboxPEPAuth](#sandboxpepauth)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `secretRef` _[LocalObjectReference](https://kubernetes.io/docs/reference/generated/kubernetes-api/v/#localobjectreference-v1-core)_ | secretRef references a kubernetes.io/tls Secret (tls.crt and tls.key) in the Sandbox namespace. |  | Optional: \{\} <br /> |
+| `certDir` _string_ | certDir is a node-local directory containing hot-reloaded tls.crt and tls.key files. |  | MaxLength: 512 <br />Pattern: `^/.*` <br />Optional: \{\} <br /> |
+
+
+
+
+#### SandboxNetworkParameter
+
+
+
+SandboxNetworkParameter represents a custom key-value parameter passed through DRA
+OpaqueDeviceConfiguration to the network driver and the Policy Enforcement Point (PEP).
+
+
+
+_Appears in:_
+- [SandboxNetworkSpec](#sandboxnetworkspec)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `name` _string_ | name is the unique key of the custom parameter. |  | MaxLength: 128 <br />MinLength: 1 <br />Required: \{\} <br /> |
+| `value` _string_ | value is the string value associated with name. |  | MaxLength: 1024 <br />Required: \{\} <br /> |
+
+
+#### SandboxNetworkSpec
+
+
+
+SandboxNetworkSpec configures Kubernetes Network Driver (DRA + NRI) network plumbing on a
+Sandbox or SandboxTemplate without introducing standalone network policy CRDs. Policy
+enforcement and credential injection remain the responsibility of the configured Policy
+Enforcement Point (PEP); driver-specific datapath settings (such as adapterMode or proxy
+ports) belong in the referenced DRA DeviceClass.
+
+
+
+_Appears in:_
+- [SandboxBlueprint](#sandboxblueprint)
+- [SandboxNetworkConfiguration](#sandboxnetworkconfiguration)
+- [SandboxSpec](#sandboxspec)
+- [SandboxTemplateSpec](#sandboxtemplatespec)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `driverName` _string_ | driverName is the Kubernetes DRA driver name (lowercase DNS subdomain, max 63 chars)<br />that implements network plumbing for the Sandbox (for example, dra.agents.net or a<br />third-party driver). Defaults to dra.agents.net. | dra.agents.net | MaxLength: 63 <br />MinLength: 1 <br />Pattern: `^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$` <br />Optional: \{\} <br /> |
+| `deviceClassName` _string_ | deviceClassName names the Kubernetes DRA DeviceClass that allocates network plumbing<br />and supplies driver-specific configuration (such as adapterMode, loopback proxy port,<br />or CNI datapath options). Defaults to driverName when omitted. |  | MaxLength: 253 <br />Pattern: `^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$` <br />Optional: \{\} <br /> |
+| `confinementMode` _[SandboxConfinementMode](#sandboxconfinementmode)_ | confinementMode selects how the backing Pod is isolated from direct network egress.<br />Defaults to PodNetworkIsolated. | PodNetworkIsolated | Enum: [PodNetworkIsolated NetworkPolicyDenyAll] <br />Optional: \{\} <br /> |
+| `policyEnforcementPoint` _[SandboxPolicyEnforcementPoint](#sandboxpolicyenforcementpoint)_ | policyEnforcementPoint configures the Policy Enforcement Point (PEP) that intercepts<br />sandbox traffic, enforces network policies, and injects credentials. |  | Required: \{\} <br /> |
+| `caTrust` _[SandboxCATrustSpec](#sandboxcatrustspec)_ | caTrust defines Pod-scoped CA certificates mounted per agents.net (AGENT_CA_CERT)<br />and mapped into language-specific TLS trust environment variables. |  | Optional: \{\} <br /> |
+| `ingressPorts` _[SandboxIngressPort](#sandboxingressport) array_ | ingressPorts exposes specific container ports through the agents.net ingress tunnel. |  | MaxItems: 32 <br />Optional: \{\} <br /> |
+| `parameters` _[SandboxNetworkParameter](#sandboxnetworkparameter) array_ | parameters passes custom key-value metadata through DRA OpaqueDeviceConfiguration<br />to the network driver and the Policy Enforcement Point (PEP). |  | MaxItems: 64 <br />Optional: \{\} <br /> |
 
 
 #### SandboxOperatingMode
@@ -195,12 +451,229 @@ _Appears in:_
 | `Suspended` | SandboxOperatingModeSuspended indicates the Sandbox should be suspended: the<br />controller terminates the backing Pod while retaining the Sandbox object and its<br />volumes. Progress of the suspension is reported by the Suspended condition (see<br />SandboxConditionSuspended).<br /> |
 
 
+#### SandboxPEPAuth
+
+
+
+SandboxPEPAuth is a discriminated union selecting how the network driver authenticates
+to the Policy Enforcement Point (PEP).
+
+
+
+_Appears in:_
+- [SandboxPolicyEnforcementPoint](#sandboxpolicyenforcementpoint)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `type` _[SandboxPEPAuthType](#sandboxpepauthtype)_ | type selects the authentication mechanism: MTLS, SPIFFE, PodCertificate, or ServiceAccountToken. |  | Enum: [MTLS SPIFFE PodCertificate ServiceAccountToken] <br />Required: \{\} <br /> |
+| `mtls` _[SandboxMTLSAuth](#sandboxmtlsauth)_ | mtls configures rotated PEM client certificate authentication. |  | Optional: \{\} <br /> |
+| `spiffe` _[SandboxSPIFFEAuth](#sandboxspiffeauth)_ | spiffe configures SPIFFE Workload API or SPIRE Delegated Identity authentication. |  | Optional: \{\} <br /> |
+| `podCertificate` _[SandboxPodCertificateAuth](#sandboxpodcertificateauth)_ | podCertificate configures KEP-4317 kubelet-minted per-Pod certificate authentication. |  | Optional: \{\} <br /> |
+| `serviceAccountToken` _[SandboxServiceAccountTokenAuth](#sandboxserviceaccounttokenauth)_ | serviceAccountToken configures audience-bound Kubernetes ServiceAccount JWT authentication. |  | Optional: \{\} <br /> |
+
+
+#### SandboxPEPAuthType
+
+_Underlying type:_ _string_
+
+SandboxPEPAuthType selects the authentication mechanism used between the network driver
+and the Policy Enforcement Point (PEP).
+
+_Validation:_
+- Enum: [MTLS SPIFFE PodCertificate ServiceAccountToken]
+
+_Appears in:_
+- [SandboxPEPAuth](#sandboxpepauth)
+
+| Field | Description |
+| --- | --- |
+| `MTLS` | SandboxPEPAuthTypeMTLS authenticates using a rotated PEM client certificate and key.<br /> |
+| `SPIFFE` | SandboxPEPAuthTypeSPIFFE authenticates using X.509-SVIDs from the SPIFFE Workload API<br />or SPIRE Delegated Identity API.<br /> |
+| `PodCertificate` | SandboxPEPAuthTypePodCertificate authenticates using a per-Pod X.509 certificate<br />minted by kubelet via KEP-4317 PodCertificateRequest.<br /> |
+| `ServiceAccountToken` | SandboxPEPAuthTypeServiceAccountToken authenticates using an audience-bound Kubernetes<br />ServiceAccount JWT sent in Proxy-Authorization.<br /> |
+
+
+#### SandboxPEPTLS
+
+
+
+SandboxPEPTLS configures TLS verification of the Policy Enforcement Point (PEP).
+
+
+
+_Appears in:_
+- [SandboxPolicyEnforcementPoint](#sandboxpolicyenforcementpoint)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `serverName` _string_ | serverName overrides the TLS Server Name Indication (SNI) and hostname verification target. |  | MaxLength: 253 <br />Optional: \{\} <br /> |
+| `caCertificateRefs` _[SandboxCASource](#sandboxcasource) array_ | caCertificateRefs lists one or more CA certificate sources (ConfigMap, Secret,<br />ClusterTrustBundle, or HostPath) used to verify the PEP server certificate.<br />Follows Kubernetes Gateway API BackendTLSPolicy and cert-manager conventions (default key ca.crt). |  | MaxItems: 16 <br />Optional: \{\} <br /> |
+| `trustDomain` _string_ | trustDomain specifies the SPIFFE trust domain accepted when verifying a PEP X.509-SVID. |  | MaxLength: 255 <br />Optional: \{\} <br /> |
+| `acceptedSPIFFEIDs` _string array_ | acceptedSPIFFEIDs restricts the PEP server certificate to one of these exact SPIFFE IDs. |  | MaxItems: 32 <br />items:MaxLength: 2048 <br />items:MinLength: 10 <br />items:Pattern: `^spiffe://[^ \t\r\n]+$` <br />Optional: \{\} <br /> |
+
+
+#### SandboxPodCertificateAuth
+
+
+
+SandboxPodCertificateAuth configures KEP-4317 Kubernetes native PodCertificate mTLS.
+
+
+
+_Appears in:_
+- [SandboxPEPAuth](#sandboxpepauth)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `signerName` _string_ | signerName is the Kubernetes PodCertificateRequest signer name (for example,<br />spiffe.io/workload-identity or a cert-manager signer). |  | MaxLength: 253 <br />MinLength: 1 <br />Required: \{\} <br /> |
+| `keyType` _[SandboxPodCertificateKeyType](#sandboxpodcertificatekeytype)_ | keyType is the private key algorithm kubelet generates for the Pod certificate.<br />Defaults to ECDSAP256. | ECDSAP256 | Enum: [RSA3072 RSA4096 ECDSAP256 ECDSAP384 ECDSAP521 ED25519] <br />Optional: \{\} <br /> |
+| `maxExpirationSeconds` _integer_ | maxExpirationSeconds requests the maximum certificate lifetime in seconds (3600..7862400). |  | Maximum: 7.8624e+06 <br />Minimum: 3600 <br />Optional: \{\} <br /> |
+
+
+#### SandboxPodCertificateKeyType
+
+_Underlying type:_ _string_
+
+SandboxPodCertificateKeyType defines the keypair algorithm kubelet generates for
+KEP-4317 PodCertificate projections.
+
+_Validation:_
+- Enum: [RSA3072 RSA4096 ECDSAP256 ECDSAP384 ECDSAP521 ED25519]
+
+_Appears in:_
+- [SandboxPodCertificateAuth](#sandboxpodcertificateauth)
+
+| Field | Description |
+| --- | --- |
+| `RSA3072` | SandboxPodCertificateKeyTypeRSA3072 generates a 3072-bit RSA keypair.<br /> |
+| `RSA4096` | SandboxPodCertificateKeyTypeRSA4096 generates a 4096-bit RSA keypair.<br /> |
+| `ECDSAP256` | SandboxPodCertificateKeyTypeECDSAP256 generates a P-256 ECDSA keypair.<br /> |
+| `ECDSAP384` | SandboxPodCertificateKeyTypeECDSAP384 generates a P-384 ECDSA keypair.<br /> |
+| `ECDSAP521` | SandboxPodCertificateKeyTypeECDSAP521 generates a P-521 ECDSA keypair.<br /> |
+| `ED25519` | SandboxPodCertificateKeyTypeED25519 generates an Ed25519 keypair.<br /> |
+
+
+#### SandboxPolicyEnforcementPoint
+
+
+
+SandboxPolicyEnforcementPoint defines the Policy Enforcement Point (PEP) that receives
+intercepted sandbox traffic, enforces network policies, and injects credentials.
+Transport selection is negotiated automatically from the URL scheme (https, http, unix)
+and TLS ALPN (preferring HTTP/2 with automatic fallback to HTTP/1.1).
+
+
+
+_Appears in:_
+- [SandboxNetworkSpec](#sandboxnetworkspec)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `url` _string_ | url is the Policy Enforcement Point (PEP) endpoint URL (for example,<br />https://egress-portal.sandbox-system.svc:8443). Supported schemes are https, http, and unix. |  | MaxLength: 512 <br />MinLength: 1 <br />Pattern: `^(https?\|unix)://[^ \t\r\n]+$` <br />Required: \{\} <br /> |
+| `tls` _[SandboxPEPTLS](#sandboxpeptls)_ | tls configures server certificate verification for the PEP connection. |  | Optional: \{\} <br /> |
+| `auth` _[SandboxPEPAuth](#sandboxpepauth)_ | auth configures client authentication and workload identity attestation to the PEP. |  | Optional: \{\} <br /> |
+
+
+#### SandboxSPIFFEAuth
+
+
+
+SandboxSPIFFEAuth configures SPIFFE X.509-SVID authentication to the Policy Enforcement Point (PEP).
+
+
+
+_Appears in:_
+- [SandboxPEPAuth](#sandboxpepauth)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `mode` _[SandboxSPIFFEMode](#sandboxspiffemode)_ | mode selects Node SVID (Workload API) or DelegatedPod SVID (SPIRE Delegated Identity API).<br />Defaults to Node. | Node | Enum: [Node DelegatedPod] <br />Optional: \{\} <br /> |
+| `workloadSocketPath` _string_ | workloadSocketPath overrides the node's SPIFFE Workload API Unix domain socket path. |  | MaxLength: 512 <br />Pattern: `^/.*` <br />Optional: \{\} <br /> |
+| `delegatedSocketPath` _string_ | delegatedSocketPath overrides the SPIRE Agent Delegated Identity Unix domain socket path<br />used when mode is DelegatedPod. |  | MaxLength: 512 <br />Pattern: `^/.*` <br />Optional: \{\} <br /> |
+
+
+#### SandboxSPIFFEMode
+
+_Underlying type:_ _string_
+
+SandboxSPIFFEMode defines whether SPIFFE authentication uses the node DaemonSet SVID
+or a per-Pod SVID obtained via the SPIRE Delegated Identity API.
+
+_Validation:_
+- Enum: [Node DelegatedPod]
+
+_Appears in:_
+- [SandboxSPIFFEAuth](#sandboxspiffeauth)
+
+| Field | Description |
+| --- | --- |
+| `Node` | SandboxSPIFFEModeNode authenticates the node network driver with its own SPIFFE<br />X.509-SVID and attaches attested Pod and Sandbox identity metadata to PEP requests.<br /> |
+| `DelegatedPod` | SandboxSPIFFEModeDelegatedPod obtains a per-Pod X.509-SVID in memory from the local<br />SPIRE Agent Delegated Identity API so private keys never enter the Pod.<br /> |
+
+
+#### SandboxSecretKeyRef
+
+
+
+SandboxSecretKeyRef selects a key inside a Secret in the Sandbox namespace.
+Compatible with cert-manager kubernetes.io/tls Secrets (default key ca.crt, or tls.crt)
+and trust-manager Secret bundles. Only CERTIFICATE PEM blocks are read.
+
+
+
+_Appears in:_
+- [SandboxCASource](#sandboxcasource)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `name` _string_ | name is the Secret name in the Sandbox namespace. |  | MaxLength: 253 <br />MinLength: 1 <br />Required: \{\} <br /> |
+| `key` _string_ | key is the Secret data key containing PEM-encoded certificates. Defaults to ca.crt. | ca.crt | MaxLength: 253 <br />Optional: \{\} <br /> |
+
+
+#### SandboxServiceAccountTokenAuth
+
+
+
+SandboxServiceAccountTokenAuth configures Kubernetes bound ServiceAccount JWT authentication
+sent over TLS in Proxy-Authorization.
+
+
+
+_Appears in:_
+- [SandboxPEPAuth](#sandboxpepauth)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `audience` _string_ | audience is the required target audience for the projected ServiceAccount JWT.<br />Setting a dedicated audience prevents replay against the Kubernetes API server. |  | MaxLength: 512 <br />MinLength: 1 <br />Required: \{\} <br /> |
+| `mode` _[SandboxServiceAccountTokenMode](#sandboxserviceaccounttokenmode)_ | mode selects Node (driver token with node-name attestation) or Pod (kubelet-projected<br />per-Pod token isolated by the network driver). Defaults to Node. | Node | Enum: [Node Pod] <br />Optional: \{\} <br /> |
+| `expirationSeconds` _integer_ | expirationSeconds controls the projected token lifetime in seconds (600..86400).<br />Defaults to 3600. | 3600 | Maximum: 86400 <br />Minimum: 600 <br />Optional: \{\} <br /> |
+
+
+#### SandboxServiceAccountTokenMode
+
+_Underlying type:_ _string_
+
+SandboxServiceAccountTokenMode defines whether ServiceAccountToken authentication uses
+the node driver's projected token or a kubelet-projected per-Pod token.
+
+_Validation:_
+- Enum: [Node Pod]
+
+_Appears in:_
+- [SandboxServiceAccountTokenAuth](#sandboxserviceaccounttokenauth)
+
+| Field | Description |
+| --- | --- |
+| `Node` | SandboxServiceAccountTokenModeNode sends the node driver's audience-bound JWT<br />together with attested Pod metadata (compatible with TokenReview node-name verification).<br /> |
+| `Pod` | SandboxServiceAccountTokenModePod sends a kubelet-projected, audience-bound JWT for the<br />Pod's ServiceAccount. The network driver is responsible for isolating the projected volume<br />from untrusted workload containers.<br /> |
+
+
 #### SandboxSpec
 
 
 
 SandboxSpec defines the desired state of Sandbox.
-volumeClaimTemplates is immutable after creation.
+volumeClaimTemplates and network are immutable after creation.
 
 
 
@@ -213,8 +686,9 @@ _Appears in:_
 | `volumeClaimTemplates` _[PersistentVolumeClaimTemplate](#persistentvolumeclaimtemplate) array_ | volumeClaimTemplates is a list of claims that the sandbox pod is allowed to reference.<br />When creating a sandbox, PVCs will be created from these templates.<br />Every claim in this list must have at least one matching access mode with a provisioner volume.<br />Each PVC is named after the template and the Sandbox, joined by a hyphen, and is owned<br />by the Sandbox. It is kept while the Sandbox is suspended or retained after expiry, so a<br />resumed Pod reattaches it with its data. It is garbage collected when the Sandbox<br />object is deleted.<br />On a Sandbox this list is immutable after creation.<br />NOTE: This list is atomic. Updates to this field will replace the entire list rather than merging with existing entries.<br />Each entry must have a unique, non-empty metadata.name.<br />At most 128 entries: the cap only bounds the CEL cost of the uniqueness rule. |  | MaxItems: 128 <br />Optional: \{\} <br /> |
 | `service` _boolean_ | service controls whether the controller should automatically create a<br />headless Service for the Sandbox workload.<br />When unset, the controller preserves existing Services for backward<br />compatibility but does not create new ones. Set to true to enable or false<br />to explicitly disable and remove the Service. |  | Optional: \{\} <br /> |
 | `failedPodPolicy` _[FailedPodPolicy](#failedpodpolicy)_ | failedPodPolicy controls what happens when the backing Pod enters phase Failed.<br />Retain (default): leave the Failed pod and surface Finished=True.<br />Recreate: delete the controller-owned Failed pod so a new one is created;<br />the Sandbox identity and any Sandbox-owned PVCs are retained.<br />Combined with restartPolicy Never and a container that always exits non-zero,<br />Recreate can recreate the Pod repeatedly; the controller applies Deployment-style<br />in-memory exponential backoff (5s, doubling up to 5m) between creates so a crash<br />loop cannot hot-loop the API server. Backoff resets after the replacement Pod has<br />been continuously observed Running for 10 minutes. Backoff state is not persisted<br />in status. | Retain | Enum: [Retain Recreate] <br />Optional: \{\} <br /> |
-| `shutdownTime` _[Time](https://kubernetes.io/docs/reference/generated/kubernetes-api/v/#time-v1-meta)_ | shutdownTime is the absolute time at which the Sandbox expires. When the current<br />time reaches shutdownTime, the controller tears down the underlying resources<br />(Pod and Service) and then applies shutdownPolicy to the Sandbox object itself.<br />If unset, the Sandbox never expires and lives until it is explicitly deleted. |  | Format: date-time <br />Optional: \{\} <br /> |
-| `shutdownPolicy` _[ShutdownPolicy](#shutdownpolicy)_ | shutdownPolicy determines what happens to the Sandbox object itself when it expires<br />(i.e. when shutdownTime is reached). The underlying resources (Pod, Service) are<br />always deleted on expiry regardless of this policy; shutdownPolicy governs only the<br />Sandbox object:<br />  - Retain (default): the Sandbox object is kept after its resources are torn down.<br />    Its live status fields are cleared and a Ready=False condition with reason<br />    SandboxExpired is set so the expiry is observable.<br />  - Delete: the Sandbox object is deleted once its underlying resources are removed.<br />This field has no effect while shutdownTime is unset, since the Sandbox never expires. | Retain | Enum: [Delete Retain] <br />Optional: \{\} <br /> |
+| `network` _[SandboxNetworkSpec](#sandboxnetworkspec)_ | network configures isolated traffic plumbing via a Kubernetes Network Driver (DRA and NRI).<br />When set, the controller creates a ResourceClaim for the configured driverName (defaulting<br />to dra.agents.net), embeds the network stanza in OpaqueDeviceConfiguration, wires Pod<br />confinement, and delegates policy enforcement and credential injection to the configured<br />Policy Enforcement Point (PEP). |  | Optional: \{\} <br /> |
+| `shutdownTime` _[Time](https://kubernetes.io/docs/reference/generated/kubernetes-api/v/#time-v1-meta)_ | shutdownTime is the absolute time at which the Sandbox expires. When the current<br />time reaches shutdownTime, the controller tears down the underlying resources<br />(Pod, Service, and any owned ResourceClaim and NetworkPolicy) and then applies<br />shutdownPolicy to the Sandbox object itself.<br />If unset, the Sandbox never expires and lives until it is explicitly deleted. |  | Format: date-time <br />Optional: \{\} <br /> |
+| `shutdownPolicy` _[ShutdownPolicy](#shutdownpolicy)_ | shutdownPolicy determines what happens to the Sandbox object itself when it expires<br />(i.e. when shutdownTime is reached). The underlying resources (Pod, Service, and any<br />owned ResourceClaim and NetworkPolicy) are always deleted on expiry regardless of this<br />policy; shutdownPolicy governs only the Sandbox object:<br />  - Retain (default): the Sandbox object is kept after its resources are torn down.<br />    Its live status fields are cleared and a Ready=False condition with reason<br />    SandboxExpired is set so the expiry is observable.<br />  - Delete: the Sandbox object is deleted once its underlying resources are removed.<br />This field has no effect while shutdownTime is unset, since the Sandbox never expires. | Retain | Enum: [Delete Retain] <br />Optional: \{\} <br /> |
 | `operatingMode` _[SandboxOperatingMode](#sandboxoperatingmode)_ | operatingMode specifies the desired operational state of the Sandbox:<br />  - Running (default): the controller keeps a backing Pod running.<br />  - Suspended: the controller terminates the backing Pod but retains the<br />    Sandbox object and its volumes so it can later be resumed. Resuming creates a new<br />    Pod from the current podTemplate that reattaches the retained volumes.<br />This field declares intent only. The observed readiness of the Sandbox is<br />reported by the Ready condition, and the progress of a suspension by the<br />Suspended condition; a Sandbox in Running mode is not Ready until its Pod is<br />actually up (see SandboxConditionReady).<br />Defaults to Running if not specified. | Running | Enum: [Running Suspended] <br />Optional: \{\} <br /> |
 
 
@@ -492,6 +966,7 @@ _Appears in:_
 | `volumeClaimTemplates` _[PersistentVolumeClaimTemplate](#persistentvolumeclaimtemplate) array_ | volumeClaimTemplates is a list of claims that the sandbox pod is allowed to reference.<br />When creating a sandbox, PVCs will be created from these templates.<br />Every claim in this list must have at least one matching access mode with a provisioner volume.<br />Each PVC is named after the template and the Sandbox, joined by a hyphen, and is owned<br />by the Sandbox. It is kept while the Sandbox is suspended or retained after expiry, so a<br />resumed Pod reattaches it with its data. It is garbage collected when the Sandbox<br />object is deleted.<br />On a Sandbox this list is immutable after creation.<br />NOTE: This list is atomic. Updates to this field will replace the entire list rather than merging with existing entries.<br />Each entry must have a unique, non-empty metadata.name.<br />At most 128 entries: the cap only bounds the CEL cost of the uniqueness rule. |  | MaxItems: 128 <br />Optional: \{\} <br /> |
 | `service` _boolean_ | service controls whether the controller should automatically create a<br />headless Service for the Sandbox workload.<br />When unset, the controller preserves existing Services for backward<br />compatibility but does not create new ones. Set to true to enable or false<br />to explicitly disable and remove the Service. |  | Optional: \{\} <br /> |
 | `failedPodPolicy` _[FailedPodPolicy](#failedpodpolicy)_ | failedPodPolicy controls what happens when the backing Pod enters phase Failed.<br />Retain (default): leave the Failed pod and surface Finished=True.<br />Recreate: delete the controller-owned Failed pod so a new one is created;<br />the Sandbox identity and any Sandbox-owned PVCs are retained.<br />Combined with restartPolicy Never and a container that always exits non-zero,<br />Recreate can recreate the Pod repeatedly; the controller applies Deployment-style<br />in-memory exponential backoff (5s, doubling up to 5m) between creates so a crash<br />loop cannot hot-loop the API server. Backoff resets after the replacement Pod has<br />been continuously observed Running for 10 minutes. Backoff state is not persisted<br />in status. | Retain | Enum: [Retain Recreate] <br />Optional: \{\} <br /> |
+| `network` _[SandboxNetworkSpec](#sandboxnetworkspec)_ | network configures isolated traffic plumbing via a Kubernetes Network Driver (DRA and NRI).<br />When set, the controller creates a ResourceClaim for the configured driverName (defaulting<br />to dra.agents.net), embeds the network stanza in OpaqueDeviceConfiguration, wires Pod<br />confinement, and delegates policy enforcement and credential injection to the configured<br />Policy Enforcement Point (PEP). |  | Optional: \{\} <br /> |
 | `networkPolicy` _[NetworkPolicySpec](#networkpolicyspec)_ | networkPolicy defines the network policy to be applied to the sandboxes<br />created from this template. A single shared NetworkPolicy is created per Template.<br />Behavior is dictated by the NetworkPolicyManagement field:<br />- If Management is "Unmanaged": This field is completely ignored.<br />- If Management is "Managed" (default) and this field is omitted (nil): The controller<br />  automatically applies a strict Secure Default policy:<br />    * Ingress: Allow traffic only from the Sandbox Router.<br />    * Egress: Allow Public Internet only. Blocks internal IPs (RFC1918), Metadata Server, etc.<br />- If Management is "Managed" and this field is provided: The controller applies your custom rules.<br />Update Behavior:<br />Because the NetworkPolicy is shared at the template level, any updates to these rules<br />will be applied to the single shared policy object. The underlying Kubernetes CNI will then<br />dynamically enforce the updated rules across all existing and future sandboxes<br />referencing this template.<br />NOTE: This is a restricted subset of the standard Kubernetes NetworkPolicySpec.<br />Fields like 'PodSelector' and 'PolicyTypes' are intentionally excluded because<br />they are managed by the controller to ensure strict isolation and default-deny posture.<br />WARNING: This policy enforces a strict "Default Deny" ingress posture.<br />If your Pod uses sidecars (e.g., Istio proxy, monitoring agents) that listen<br />on their own ports, the NetworkPolicy will BLOCK traffic to them by default.<br />You MUST explicitly allow traffic to these sidecar ports using 'Ingress',<br />otherwise the sidecars may fail health checks. |  | Optional: \{\} <br /> |
 | `networkPolicyManagement` _[NetworkPolicyManagement](#networkpolicymanagement)_ | networkPolicyManagement defines whether the controller manages the NetworkPolicy.<br />Valid values are "Managed" (default) or "Unmanaged". | Managed | Enum: [Managed Unmanaged] <br />Optional: \{\} <br /> |
 | `envVarsInjectionPolicy` _[EnvVarsInjectionPolicy](#envvarsinjectionpolicy)_ | envVarsInjectionPolicy controls whether a SandboxClaim may set environment variables<br />(spec.env) on sandboxes created from this template:<br />  - Disallowed (default): claims may not set any environment variables; a claim that<br />    specifies spec.env is rejected.<br />  - Allowed: claims may add environment variables whose names are not already defined<br />    in the template, but may not change the value of a name the template already defines.<br />  - Overrides: claims may add new environment variables and override the values of names<br />    the template already defines.<br />Note: environment variables are baked into the Pod before it is created; they cannot be<br />injected into an already-running warm pool Pod. Consequently, allowing injection here<br />(Allowed or Overrides) only takes effect on a per-claim basis: any claim that actually<br />sets spec.env is forced to cold-start a fresh Sandbox and cannot adopt a warm pool<br />Sandbox. Claims that set no environment variables still use the warm pool normally. | Disallowed | Enum: [Allowed Overrides Disallowed] <br />Optional: \{\} <br /> |

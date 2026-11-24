@@ -25,7 +25,7 @@ import (
 // with apply.
 //
 // SandboxSpec defines the desired state of Sandbox.
-// volumeClaimTemplates is immutable after creation.
+// volumeClaimTemplates and network are immutable after creation.
 type SandboxSpecApplyConfiguration struct {
 	// SandboxBlueprint defines the workload configuration shared with SandboxTemplate.
 	// NOTE: Once a field is added here, it is promoted to both Sandbox and SandboxTemplate.
@@ -87,6 +87,14 @@ func (b *SandboxSpecApplyConfiguration) WithService(value bool) *SandboxSpecAppl
 // If called multiple times, the FailedPodPolicy field is set to the value of the last call.
 func (b *SandboxSpecApplyConfiguration) WithFailedPodPolicy(value apiv1beta1.FailedPodPolicy) *SandboxSpecApplyConfiguration {
 	b.SandboxBlueprintApplyConfiguration.FailedPodPolicy = &value
+	return b
+}
+
+// WithNetwork sets the Network field in the declarative configuration to the given value
+// and returns the receiver, so that objects can be built by chaining "With" function invocations.
+// If called multiple times, the Network field is set to the value of the last call.
+func (b *SandboxSpecApplyConfiguration) WithNetwork(value *SandboxNetworkSpecApplyConfiguration) *SandboxSpecApplyConfiguration {
+	b.SandboxBlueprintApplyConfiguration.Network = value
 	return b
 }
 

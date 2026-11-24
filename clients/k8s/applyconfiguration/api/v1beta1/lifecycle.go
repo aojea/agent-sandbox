@@ -28,13 +28,14 @@ import (
 type LifecycleApplyConfiguration struct {
 	// shutdownTime is the absolute time at which the Sandbox expires. When the current
 	// time reaches shutdownTime, the controller tears down the underlying resources
-	// (Pod and Service) and then applies shutdownPolicy to the Sandbox object itself.
+	// (Pod, Service, and any owned ResourceClaim and NetworkPolicy) and then applies
+	// shutdownPolicy to the Sandbox object itself.
 	// If unset, the Sandbox never expires and lives until it is explicitly deleted.
 	ShutdownTime *v1.Time `json:"shutdownTime,omitempty"`
 	// shutdownPolicy determines what happens to the Sandbox object itself when it expires
-	// (i.e. when shutdownTime is reached). The underlying resources (Pod, Service) are
-	// always deleted on expiry regardless of this policy; shutdownPolicy governs only the
-	// Sandbox object:
+	// (i.e. when shutdownTime is reached). The underlying resources (Pod, Service, and any
+	// owned ResourceClaim and NetworkPolicy) are always deleted on expiry regardless of this
+	// policy; shutdownPolicy governs only the Sandbox object:
 	// - Retain (default): the Sandbox object is kept after its resources are torn down.
 	// Its live status fields are cleared and a Ready=False condition with reason
 	// SandboxExpired is set so the expiry is observable.

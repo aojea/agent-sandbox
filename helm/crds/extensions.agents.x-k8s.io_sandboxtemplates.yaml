@@ -41,6 +41,451 @@ spec:
                 - Retain
                 - Recreate
                 type: string
+              network:
+                properties:
+                  caTrust:
+                    properties:
+                      bundleMode:
+                        default: AppendSystemRoots
+                        enum:
+                        - AppendSystemRoots
+                        - Replace
+                        type: string
+                      mode:
+                        default: InjectEnv
+                        enum:
+                        - None
+                        - MountOnly
+                        - InjectEnv
+                        type: string
+                      sources:
+                        items:
+                          properties:
+                            clusterTrustBundle:
+                              properties:
+                                labelSelector:
+                                  properties:
+                                    matchExpressions:
+                                      items:
+                                        properties:
+                                          key:
+                                            type: string
+                                          operator:
+                                            type: string
+                                          values:
+                                            items:
+                                              type: string
+                                            type: array
+                                            x-kubernetes-list-type: atomic
+                                        required:
+                                        - key
+                                        - operator
+                                        type: object
+                                      type: array
+                                      x-kubernetes-list-type: atomic
+                                    matchLabels:
+                                      additionalProperties:
+                                        type: string
+                                      type: object
+                                  type: object
+                                  x-kubernetes-map-type: atomic
+                                name:
+                                  maxLength: 253
+                                  type: string
+                                signerName:
+                                  maxLength: 253
+                                  type: string
+                              type: object
+                              x-kubernetes-validations:
+                              - message: exactly one of name or signerName must be
+                                  set
+                                rule: (has(self.name) && size(self.name) > 0) != (has(self.signerName)
+                                  && size(self.signerName) > 0)
+                              - message: labelSelector may only be set when signerName
+                                  is set
+                                rule: '!has(self.labelSelector) || (has(self.signerName)
+                                  && size(self.signerName) > 0)'
+                            configMapRef:
+                              properties:
+                                key:
+                                  default: ca.crt
+                                  maxLength: 253
+                                  type: string
+                                name:
+                                  maxLength: 253
+                                  minLength: 1
+                                  type: string
+                              required:
+                              - name
+                              type: object
+                            hostPath:
+                              maxLength: 512
+                              pattern: ^/.*
+                              type: string
+                            secretRef:
+                              properties:
+                                key:
+                                  default: ca.crt
+                                  maxLength: 253
+                                  type: string
+                                name:
+                                  maxLength: 253
+                                  minLength: 1
+                                  type: string
+                              required:
+                              - name
+                              type: object
+                            type:
+                              enum:
+                              - ConfigMap
+                              - Secret
+                              - ClusterTrustBundle
+                              - HostPath
+                              type: string
+                          required:
+                          - type
+                          type: object
+                          x-kubernetes-validations:
+                          - message: configMapRef must be set and other source fields
+                              omitted when type is ConfigMap
+                            rule: 'self.type == ''ConfigMap'' ? (has(self.configMapRef)
+                              && !has(self.secretRef) && !has(self.clusterTrustBundle)
+                              && !has(self.hostPath)) : true'
+                          - message: secretRef must be set and other source fields
+                              omitted when type is Secret
+                            rule: 'self.type == ''Secret'' ? (has(self.secretRef)
+                              && !has(self.configMapRef) && !has(self.clusterTrustBundle)
+                              && !has(self.hostPath)) : true'
+                          - message: clusterTrustBundle must be set and other source
+                              fields omitted when type is ClusterTrustBundle
+                            rule: 'self.type == ''ClusterTrustBundle'' ? (has(self.clusterTrustBundle)
+                              && !has(self.configMapRef) && !has(self.secretRef) &&
+                              !has(self.hostPath)) : true'
+                          - message: hostPath must be set and other source fields
+                              omitted when type is HostPath
+                            rule: 'self.type == ''HostPath'' ? (has(self.hostPath)
+                              && size(self.hostPath) > 0 && !has(self.configMapRef)
+                              && !has(self.secretRef) && !has(self.clusterTrustBundle))
+                              : true'
+                        maxItems: 16
+                        type: array
+                        x-kubernetes-list-type: atomic
+                    type: object
+                  confinementMode:
+                    default: PodNetworkIsolated
+                    enum:
+                    - PodNetworkIsolated
+                    - NetworkPolicyDenyAll
+                    type: string
+                  deviceClassName:
+                    maxLength: 253
+                    pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
+                    type: string
+                  driverName:
+                    default: dra.agents.net
+                    maxLength: 63
+                    minLength: 1
+                    pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
+                    type: string
+                  ingressPorts:
+                    items:
+                      properties:
+                        port:
+                          format: int32
+                          maximum: 65535
+                          minimum: 1
+                          type: integer
+                        protocol:
+                          default: TCP
+                          enum:
+                          - TCP
+                          - UDP
+                          type: string
+                      required:
+                      - port
+                      type: object
+                    maxItems: 32
+                    type: array
+                    x-kubernetes-list-map-keys:
+                    - port
+                    - protocol
+                    x-kubernetes-list-type: map
+                  parameters:
+                    items:
+                      properties:
+                        name:
+                          maxLength: 128
+                          minLength: 1
+                          type: string
+                        value:
+                          maxLength: 1024
+                          type: string
+                      required:
+                      - name
+                      - value
+                      type: object
+                    maxItems: 64
+                    type: array
+                    x-kubernetes-list-map-keys:
+                    - name
+                    x-kubernetes-list-type: map
+                  policyEnforcementPoint:
+                    properties:
+                      auth:
+                        properties:
+                          mtls:
+                            properties:
+                              certDir:
+                                maxLength: 512
+                                pattern: ^/.*
+                                type: string
+                              secretRef:
+                                properties:
+                                  name:
+                                    default: ""
+                                    type: string
+                                type: object
+                                x-kubernetes-map-type: atomic
+                            type: object
+                            x-kubernetes-validations:
+                            - message: exactly one of secretRef.name or certDir must
+                                be set for MTLS auth
+                              rule: (has(self.secretRef) && has(self.secretRef.name)
+                                && size(self.secretRef.name) > 0) != (has(self.certDir)
+                                && size(self.certDir) > 0)
+                          podCertificate:
+                            properties:
+                              keyType:
+                                default: ECDSAP256
+                                enum:
+                                - RSA3072
+                                - RSA4096
+                                - ECDSAP256
+                                - ECDSAP384
+                                - ECDSAP521
+                                - ED25519
+                                type: string
+                              maxExpirationSeconds:
+                                format: int32
+                                maximum: 7862400
+                                minimum: 3600
+                                type: integer
+                              signerName:
+                                maxLength: 253
+                                minLength: 1
+                                type: string
+                            required:
+                            - signerName
+                            type: object
+                          serviceAccountToken:
+                            properties:
+                              audience:
+                                maxLength: 512
+                                minLength: 1
+                                type: string
+                              expirationSeconds:
+                                default: 3600
+                                format: int32
+                                maximum: 86400
+                                minimum: 600
+                                type: integer
+                              mode:
+                                default: Node
+                                enum:
+                                - Node
+                                - Pod
+                                type: string
+                            required:
+                            - audience
+                            type: object
+                          spiffe:
+                            properties:
+                              delegatedSocketPath:
+                                maxLength: 512
+                                pattern: ^/.*
+                                type: string
+                              mode:
+                                default: Node
+                                enum:
+                                - Node
+                                - DelegatedPod
+                                type: string
+                              workloadSocketPath:
+                                maxLength: 512
+                                pattern: ^/.*
+                                type: string
+                            type: object
+                          type:
+                            enum:
+                            - MTLS
+                            - SPIFFE
+                            - PodCertificate
+                            - ServiceAccountToken
+                            type: string
+                        required:
+                        - type
+                        type: object
+                        x-kubernetes-validations:
+                        - message: mtls must be set and other auth fields omitted
+                            when type is MTLS
+                          rule: 'self.type == ''MTLS'' ? (has(self.mtls) && !has(self.spiffe)
+                            && !has(self.podCertificate) && !has(self.serviceAccountToken))
+                            : true'
+                        - message: only spiffe may be set when type is SPIFFE
+                          rule: 'self.type == ''SPIFFE'' ? (!has(self.mtls) && !has(self.podCertificate)
+                            && !has(self.serviceAccountToken)) : true'
+                        - message: podCertificate must be set and other auth fields
+                            omitted when type is PodCertificate
+                          rule: 'self.type == ''PodCertificate'' ? (has(self.podCertificate)
+                            && !has(self.mtls) && !has(self.spiffe) && !has(self.serviceAccountToken))
+                            : true'
+                        - message: serviceAccountToken must be set and other auth
+                            fields omitted when type is ServiceAccountToken
+                          rule: 'self.type == ''ServiceAccountToken'' ? (has(self.serviceAccountToken)
+                            && !has(self.mtls) && !has(self.spiffe) && !has(self.podCertificate))
+                            : true'
+                      tls:
+                        properties:
+                          acceptedSPIFFEIDs:
+                            items:
+                              maxLength: 2048
+                              minLength: 10
+                              pattern: ^spiffe://[^ \t\r\n]+$
+                              type: string
+                            maxItems: 32
+                            type: array
+                            x-kubernetes-list-type: atomic
+                          caCertificateRefs:
+                            items:
+                              properties:
+                                clusterTrustBundle:
+                                  properties:
+                                    labelSelector:
+                                      properties:
+                                        matchExpressions:
+                                          items:
+                                            properties:
+                                              key:
+                                                type: string
+                                              operator:
+                                                type: string
+                                              values:
+                                                items:
+                                                  type: string
+                                                type: array
+                                                x-kubernetes-list-type: atomic
+                                            required:
+                                            - key
+                                            - operator
+                                            type: object
+                                          type: array
+                                          x-kubernetes-list-type: atomic
+                                        matchLabels:
+                                          additionalProperties:
+                                            type: string
+                                          type: object
+                                      type: object
+                                      x-kubernetes-map-type: atomic
+                                    name:
+                                      maxLength: 253
+                                      type: string
+                                    signerName:
+                                      maxLength: 253
+                                      type: string
+                                  type: object
+                                  x-kubernetes-validations:
+                                  - message: exactly one of name or signerName must
+                                      be set
+                                    rule: (has(self.name) && size(self.name) > 0)
+                                      != (has(self.signerName) && size(self.signerName)
+                                      > 0)
+                                  - message: labelSelector may only be set when signerName
+                                      is set
+                                    rule: '!has(self.labelSelector) || (has(self.signerName)
+                                      && size(self.signerName) > 0)'
+                                configMapRef:
+                                  properties:
+                                    key:
+                                      default: ca.crt
+                                      maxLength: 253
+                                      type: string
+                                    name:
+                                      maxLength: 253
+                                      minLength: 1
+                                      type: string
+                                  required:
+                                  - name
+                                  type: object
+                                hostPath:
+                                  maxLength: 512
+                                  pattern: ^/.*
+                                  type: string
+                                secretRef:
+                                  properties:
+                                    key:
+                                      default: ca.crt
+                                      maxLength: 253
+                                      type: string
+                                    name:
+                                      maxLength: 253
+                                      minLength: 1
+                                      type: string
+                                  required:
+                                  - name
+                                  type: object
+                                type:
+                                  enum:
+                                  - ConfigMap
+                                  - Secret
+                                  - ClusterTrustBundle
+                                  - HostPath
+                                  type: string
+                              required:
+                              - type
+                              type: object
+                              x-kubernetes-validations:
+                              - message: configMapRef must be set and other source
+                                  fields omitted when type is ConfigMap
+                                rule: 'self.type == ''ConfigMap'' ? (has(self.configMapRef)
+                                  && !has(self.secretRef) && !has(self.clusterTrustBundle)
+                                  && !has(self.hostPath)) : true'
+                              - message: secretRef must be set and other source fields
+                                  omitted when type is Secret
+                                rule: 'self.type == ''Secret'' ? (has(self.secretRef)
+                                  && !has(self.configMapRef) && !has(self.clusterTrustBundle)
+                                  && !has(self.hostPath)) : true'
+                              - message: clusterTrustBundle must be set and other
+                                  source fields omitted when type is ClusterTrustBundle
+                                rule: 'self.type == ''ClusterTrustBundle'' ? (has(self.clusterTrustBundle)
+                                  && !has(self.configMapRef) && !has(self.secretRef)
+                                  && !has(self.hostPath)) : true'
+                              - message: hostPath must be set and other source fields
+                                  omitted when type is HostPath
+                                rule: 'self.type == ''HostPath'' ? (has(self.hostPath)
+                                  && size(self.hostPath) > 0 && !has(self.configMapRef)
+                                  && !has(self.secretRef) && !has(self.clusterTrustBundle))
+                                  : true'
+                            maxItems: 16
+                            type: array
+                            x-kubernetes-list-type: atomic
+                          serverName:
+                            maxLength: 253
+                            type: string
+                          trustDomain:
+                            maxLength: 255
+                            type: string
+                        type: object
+                      url:
+                        maxLength: 512
+                        minLength: 1
+                        pattern: ^(https?|unix)://[^ \t\r\n]+$
+                        type: string
+                    required:
+                    - url
+                    type: object
+                required:
+                - policyEnforcementPoint
+                type: object
               networkPolicy:
                 properties:
                   egress:
@@ -4284,5 +4729,21 @@ spec:
         required:
         - spec
         type: object
+        x-kubernetes-validations:
+        - message: spec.networkPolicy cannot be set when spec.network is configured
+          rule: '!has(self.spec.network) || !has(self.spec.networkPolicy)'
+        - message: spec.networkPolicyManagement cannot be Unmanaged when spec.network
+            is configured
+          rule: '!has(self.spec.network) || !has(self.spec.networkPolicyManagement)
+            || self.spec.networkPolicyManagement != ''Unmanaged'''
+        - message: spec.service cannot be true when spec.network uses PodNetworkIsolated
+            confinement
+          rule: '!has(self.spec.network) || (has(self.spec.network.confinementMode)
+            && self.spec.network.confinementMode != ''PodNetworkIsolated'') || !has(self.spec.service)
+            || !self.spec.service'
+        - message: spec.podTemplate.spec.hostNetwork cannot be true when spec.network
+            is configured
+          rule: '!has(self.spec.network) || !has(self.spec.podTemplate.spec.hostNetwork)
+            || !self.spec.podTemplate.spec.hostNetwork'
     served: true
     storage: true

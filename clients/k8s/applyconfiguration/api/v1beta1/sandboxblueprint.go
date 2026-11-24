@@ -73,6 +73,12 @@ type SandboxBlueprintApplyConfiguration struct {
 	// been continuously observed Running for 10 minutes. Backoff state is not persisted
 	// in status.
 	FailedPodPolicy *apiv1beta1.FailedPodPolicy `json:"failedPodPolicy,omitempty"`
+	// network configures isolated traffic plumbing via a Kubernetes Network Driver (DRA and NRI).
+	// When set, the controller creates a ResourceClaim for the configured driverName (defaulting
+	// to dra.agents.net), embeds the network stanza in OpaqueDeviceConfiguration, wires Pod
+	// confinement, and delegates policy enforcement and credential injection to the configured
+	// Policy Enforcement Point (PEP).
+	Network *SandboxNetworkSpecApplyConfiguration `json:"network,omitempty"`
 }
 
 // SandboxBlueprintApplyConfiguration constructs a declarative configuration of the SandboxBlueprint type for use with
@@ -115,5 +121,13 @@ func (b *SandboxBlueprintApplyConfiguration) WithService(value bool) *SandboxBlu
 // If called multiple times, the FailedPodPolicy field is set to the value of the last call.
 func (b *SandboxBlueprintApplyConfiguration) WithFailedPodPolicy(value apiv1beta1.FailedPodPolicy) *SandboxBlueprintApplyConfiguration {
 	b.FailedPodPolicy = &value
+	return b
+}
+
+// WithNetwork sets the Network field in the declarative configuration to the given value
+// and returns the receiver, so that objects can be built by chaining "With" function invocations.
+// If called multiple times, the Network field is set to the value of the last call.
+func (b *SandboxBlueprintApplyConfiguration) WithNetwork(value *SandboxNetworkSpecApplyConfiguration) *SandboxBlueprintApplyConfiguration {
+	b.Network = value
 	return b
 }

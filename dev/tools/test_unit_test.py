@@ -47,9 +47,10 @@ class RunGoTestsTest(unittest.TestCase):
         ]
         with (
             mock.patch.object(test_unit.subprocess, "check_output", side_effect=[
-                "go.mod\ndev/tools/go.mod\n",
+                "go.mod\ndev/tools/go.mod\ntest/e2e/images/dra-agents-net-test-upstream/go.mod\n",
                 "\n".join(packages) + "\n",
                 f"{module}/dev/tools/mdtoc\n",
+                f"{module}/test/e2e/images/dra-agents-net-test-upstream\n",
             ]),
             mock.patch.object(test_unit.subprocess, "run") as run,
         ):
@@ -73,6 +74,13 @@ class RunGoTestsTest(unittest.TestCase):
                 f"-coverprofile={os.path.join(artifact_dir, 'coverage_unit-go-dev-tools.out')}",
                 f"{module}/dev/tools/mdtoc",
             ), cwd=os.path.join(repo_root, "dev", "tools")),
+            mock.call(test_unit.utils.go_tool_args(
+                "gotestsum",
+                f"--junitfile={os.path.join(artifact_dir, 'junit_unit-go-test-e2e-images-dra-agents-net-test-upstream.xml')}",
+                "--", "-race",
+                f"-coverprofile={os.path.join(artifact_dir, 'coverage_unit-go-test-e2e-images-dra-agents-net-test-upstream.out')}",
+                f"{module}/test/e2e/images/dra-agents-net-test-upstream",
+            ), cwd=os.path.join(repo_root, "test", "e2e", "images", "dra-agents-net-test-upstream")),
         ])
 
 

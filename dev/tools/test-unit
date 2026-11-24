@@ -272,8 +272,9 @@ def find_go_modules(repo_root):
 def run_go_tests(repo_root, artifact_dir):
     """ runs Go unit tests in every Go module and returns the exit code """
     returncode = 0
-    # The e2e framework tests use fake clients and do not need a cluster.
+    # The e2e framework and e2e helper image unit tests do not need a cluster.
     framework_package = "sigs.k8s.io/agent-sandbox/test/e2e/framework"
+    images_prefix = "sigs.k8s.io/agent-sandbox/test/e2e/images/"
 
     for module_rel in find_go_modules(repo_root):
         module_dir = os.path.join(repo_root, module_rel) if module_rel else repo_root
@@ -286,6 +287,7 @@ def run_go_tests(repo_root, artifact_dir):
                 "test/e2e" not in pkg
                 or pkg == framework_package
                 or pkg.startswith(framework_package + "/")
+                or pkg.startswith(images_prefix)
             )
         ]
         if not packages:

@@ -38,18 +38,30 @@ def create_kind_config(kubelet_verbosity, containerd_loglevel=None):
               extraArgs:
                 - name: "enable-admission-plugins"
                   value: "NodeRestriction,OwnerReferencesPermissionEnforcement"
+                - name: "feature-gates"
+                  value: "ClusterTrustBundle=true"
+                - name: "runtime-config"
+                  value: "certificates.k8s.io/v1beta1=true"
           - |
             kind: KubeletConfiguration
             logging:
               verbosity: {kubelet_verbosity}
         """)
+    containerd_patches = [
+        textwrap.dedent("""\
+            [plugins."io.containerd.nri.v1.nri"]
+              disable = false
+            """),
+    ]
     if containerd_loglevel:
-        config += textwrap.dedent(f"""\
-            containerdConfigPatches:
-            - |-
-              [debug]
-                level = "{containerd_loglevel}"
-            """)
+        containerd_patches.append(textwrap.dedent(f"""\
+            [debug]
+              level = "{containerd_loglevel}"
+            """))
+    config += "containerdConfigPatches:\n"
+    for patch in containerd_patches:
+        indented = textwrap.indent(patch.rstrip("\n"), "  ")
+        config += f"- |-\n{indented}\n"
     return config
 
 

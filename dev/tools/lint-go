@@ -13,10 +13,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 import subprocess
 import sys
 
 from shared import utils
+
+LINT_MODULES = (
+    "",
+    os.path.join("packages", "dra-agents-net"),
+    os.path.join("test", "e2e", "images", "dra-agents-net-test-upstream"),
+)
 
 
 def main():
@@ -25,9 +32,17 @@ def main():
     args = ["golangci-lint", "run", f"--config={repo_root}/dev/tools/.golangci.yaml"]
     if "--fix" in sys.argv:
         args.append("--fix")
-    result = subprocess.run(utils.go_tool_args(*args), cwd=repo_root)
 
-    return result.returncode
+    returncode = 0
+    for module_rel in LINT_MODULES:
+        module_dir = os.path.join(repo_root, module_rel) if module_rel else repo_root
+        if not os.path.isfile(os.path.join(module_dir, "go.mod")):
+            continue
+        result = subprocess.run(utils.go_tool_args(*args), cwd=module_dir)
+        if result.returncode != 0:
+            returncode = result.returncode
+
+    return returncode
 
 
 if __name__ == "__main__":

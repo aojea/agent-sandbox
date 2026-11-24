@@ -45,6 +45,8 @@ class E2ETestRunner(TestRunner):
                 "agent-sandbox-controller",
                 "sandbox-router",
                 "sandbox-router-go",
+                "dra-agents-net",
+                "dra-agents-net-test-upstream",
                 "sandboxd",
                 "python-runtime-sandbox",
                 "chrome-sandbox",

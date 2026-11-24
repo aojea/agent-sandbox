@@ -28,8 +28,9 @@ import (
 //     keep a backing Pod. It does not, by itself, mean the Pod is up yet.
 //   - "readiness" is an observed state reported by the Ready condition
 //     (see SandboxConditionReady). It becomes True only once the backing Pod is
-//     actually Running and Ready with an assigned IP (and its Service exists, if
-//     requested). Note there is deliberately no separate "Running" status
+//     actually Running and Ready with an assigned IP (or assigned NodeName when
+//     using PodNetworkIsolated confinement, which has no Pod IP), and its Service
+//     exists if requested. Note there is deliberately no separate "Running" status
 //     condition: whether the Pod is running is subsumed by Ready (an unready Pod
 //     that is still starting reports Ready=False with reason DependenciesNotReady).
 //
@@ -69,7 +70,8 @@ const (
 	// distinct from the desired "running" state requested via spec.operatingMode: a
 	// Sandbox with operatingMode Running is not Ready until its Pod actually comes up.
 	// Status is True only when the backing Pod is in the Running phase with its Pod
-	// Ready condition True and at least one pod IP assigned, and, when a Service is
+	// Ready condition True and at least one pod IP assigned (or NodeName assigned
+	// under PodNetworkIsolated confinement), and, when a Service is
 	// required, that Service exists. A Service is required when it is explicitly
 	// requested (see SandboxBlueprint.Service) or, for backward compatibility, when a
 	// Service already exists even though one was not explicitly requested.
@@ -79,7 +81,8 @@ const (
 	// expired (SandboxExpired), or the controller hit an error (ReconcilerError).
 	SandboxConditionReady ConditionType = "Ready"
 	// SandboxReasonDependenciesReady is the Ready=True reason: the Pod (and Service, if
-	// requested) are provisioned and the Pod reports Ready with an assigned IP.
+	// requested) are provisioned and the Pod reports Ready with an assigned IP (or
+	// NodeName under PodNetworkIsolated confinement).
 	SandboxReasonDependenciesReady = "DependenciesReady"
 	// SandboxReasonDependenciesNotReady is a Ready=False reason: the Sandbox is expected
 	// to be running but its underlying dependencies (Pod and/or Service) are not fully
@@ -184,8 +187,8 @@ const (
 	// SandboxTemplateRefHashLabel identifies which SandboxTemplate a Sandbox originated from.
 	SandboxTemplateRefHashLabel = "agents.x-k8s.io/sandbox-template-ref-hash"
 	// SandboxNameHashLabel is the tracking label the controller stamps on every
-	// Pod, Service and PVC it creates or adopts for a Sandbox. Its value is the
-	// hash of the Sandbox name.
+	// Pod, Service, PVC, ResourceClaim, and NetworkPolicy it creates or adopts for
+	// a Sandbox. Its value is the hash of the Sandbox name.
 	SandboxNameHashLabel = "agents.x-k8s.io/sandbox-name-hash"
 )
 
@@ -346,11 +349,20 @@ type SandboxBlueprint struct {
 	// +kubebuilder:default=Retain
 	// +optional
 	FailedPodPolicy FailedPodPolicy `json:"failedPodPolicy,omitempty"`
+
+	// network configures isolated traffic plumbing via a Kubernetes Network Driver (DRA and NRI).
+	// When set, the controller creates a ResourceClaim for the configured driverName (defaulting
+	// to dra.agents.net), embeds the network stanza in OpaqueDeviceConfiguration, wires Pod
+	// confinement, and delegates policy enforcement and credential injection to the configured
+	// Policy Enforcement Point (PEP).
+	// +optional
+	Network *SandboxNetworkSpec `json:"network,omitempty"`
 }
 
 // SandboxSpec defines the desired state of Sandbox.
-// volumeClaimTemplates is immutable after creation.
+// volumeClaimTemplates and network are immutable after creation.
 // +kubebuilder:validation:XValidation:rule="has(self.volumeClaimTemplates) == has(oldSelf.volumeClaimTemplates) && (!has(self.volumeClaimTemplates) || self.volumeClaimTemplates == oldSelf.volumeClaimTemplates)",message="volumeClaimTemplates is immutable"
+// +kubebuilder:validation:XValidation:rule="has(self.network) == has(oldSelf.network) && (!has(self.network) || self.network == oldSelf.network)",message="network is immutable"
 type SandboxSpec struct {
 	// The following markers will use OpenAPI v3 schema to validate the value
 	// More info: https://book.kubebuilder.io/reference/markers/crd-validation.html
@@ -396,16 +408,17 @@ const (
 type Lifecycle struct {
 	// shutdownTime is the absolute time at which the Sandbox expires. When the current
 	// time reaches shutdownTime, the controller tears down the underlying resources
-	// (Pod and Service) and then applies shutdownPolicy to the Sandbox object itself.
+	// (Pod, Service, and any owned ResourceClaim and NetworkPolicy) and then applies
+	// shutdownPolicy to the Sandbox object itself.
 	// If unset, the Sandbox never expires and lives until it is explicitly deleted.
 	// +kubebuilder:validation:Format="date-time"
 	// +optional
 	ShutdownTime *metav1.Time `json:"shutdownTime,omitempty"`
 
 	// shutdownPolicy determines what happens to the Sandbox object itself when it expires
-	// (i.e. when shutdownTime is reached). The underlying resources (Pod, Service) are
-	// always deleted on expiry regardless of this policy; shutdownPolicy governs only the
-	// Sandbox object:
+	// (i.e. when shutdownTime is reached). The underlying resources (Pod, Service, and any
+	// owned ResourceClaim and NetworkPolicy) are always deleted on expiry regardless of this
+	// policy; shutdownPolicy governs only the Sandbox object:
 	//   - Retain (default): the Sandbox object is kept after its resources are torn down.
 	//     Its live status fields are cleared and a Ready=False condition with reason
 	//     SandboxExpired is set so the expiry is observable.
@@ -461,6 +474,8 @@ type SandboxStatus struct {
 // +kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp"
 // +kubebuilder:storageversion
 // +kubebuilder:validation:XValidation:rule="!has(self.spec.service) || !self.spec.service || size(self.metadata.name) <= 63",message="metadata.name must not exceed 63 characters when spec.service is true"
+// +kubebuilder:validation:XValidation:rule="!has(self.spec.network) || (has(self.spec.network.confinementMode) && self.spec.network.confinementMode != 'PodNetworkIsolated') || !has(self.spec.service) || !self.spec.service",message="spec.service cannot be true when spec.network uses PodNetworkIsolated confinement"
+// +kubebuilder:validation:XValidation:rule="!has(self.spec.network) || !has(self.spec.podTemplate.spec.hostNetwork) || !self.spec.podTemplate.spec.hostNetwork",message="spec.podTemplate.spec.hostNetwork cannot be true when spec.network is configured"
 // Sandbox is the Schema for the sandboxes API.
 type Sandbox struct {
 	metav1.TypeMeta `json:",inline"`

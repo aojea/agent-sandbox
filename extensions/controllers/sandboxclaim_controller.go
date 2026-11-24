@@ -1341,7 +1341,7 @@ func (r *SandboxClaimReconciler) getCandidate(ctx context.Context, claim *extens
 			// yet (no cached PodIPs) is also a pending-network candidate, so count it the same way
 			// the observation check below does to keep the caller's retry accounting consistent.
 			logger.V(1).Info("Requeuing candidate: unable to resolve warm pool update strategy", "sandbox", adopted.Name, "warmPool", claim.Spec.WarmPoolRef.Name, "error", err.Error())
-			if len(adopted.Status.PodIPs) == 0 {
+			if sandboxMissingNetworkPlacement(adopted) {
 				pendingNetworkCandidates++
 			}
 			skipped = append(skipped, adoptedKey)
@@ -1361,12 +1361,11 @@ func (r *SandboxClaimReconciler) getCandidate(ctx context.Context, claim *extens
 			continue
 		}
 
-		// Missing cached PodIPs means the controller has not observed a networked
-		// backing Pod for this candidate. Non-empty cached PodIPs narrow but cannot
-		// eliminate every concurrent Pod-deletion race. Keep pending candidates in
-		// the queue for a bounded claim-side retry. Normalize NodeName from the
-		// latest Sandbox status so a stale key does not erase placement information.
-		if len(adopted.Status.PodIPs) == 0 {
+		// Missing cached PodIPs (or NodeName for PodNetworkIsolated) means the controller has not
+		// observed a placed backing Pod for this candidate. Keep pending candidates in the queue
+		// for a bounded claim-side retry. Normalize NodeName from the latest Sandbox status so a
+		// stale key does not erase placement information.
+		if sandboxMissingNetworkPlacement(adopted) {
 			if adopted.Status.NodeName != "" {
 				adoptedKey.NodeName = adopted.Status.NodeName
 			}

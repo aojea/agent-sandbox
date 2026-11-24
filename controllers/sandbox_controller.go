@@ -26,6 +26,8 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
+	resourcev1 "k8s.io/api/resource/v1"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -379,6 +381,8 @@ type SandboxReconciler struct {
 //+kubebuilder:rbac:groups=core,resources=events,verbs=create;patch
 //+kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
 //+kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;list;watch;create;update;patch
+//+kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=get;list;watch;create;update;patch;delete
+//+kubebuilder:rbac:groups=resource.k8s.io,resources=resourceclaims,verbs=get;list;watch;create;delete
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
@@ -560,14 +564,43 @@ func (r *SandboxReconciler) reconcileChildResources(ctx context.Context, sandbox
 	// Reconcile PVCs from volumeClaimTemplates
 	recordChildErr(r.reconcilePVCs(ctx, sandbox, nameHash))
 
-	// Reconcile Pod
-	pod, recreateRequeue, podErr := r.reconcilePod(ctx, sandbox, nameHash, wd)
+	// Reconcile DRA network ResourceClaim when spec.network is configured.
+	networkClaimName, networkClaimErr := r.reconcileNetworkResourceClaim(ctx, sandbox, nameHash)
+	recordChildErr(networkClaimErr)
+
+	// Reconcile deny-all NetworkPolicy before Pod creation for standalone Sandboxes
+	// using NetworkPolicyDenyAll confinement.
+	networkPolicyErr := r.reconcileNetworkPolicy(ctx, sandbox, nameHash)
+	recordChildErr(networkPolicyErr)
+
+	// Always reconcile the Pod so existing Pods are still observed (and deleted while
+	// Suspended) even on transient ResourceClaim/NetworkPolicy errors; only gate new
+	// Pod creation until both network prerequisites succeed.
+	var (
+		pod             *corev1.Pod
+		recreateRequeue time.Duration
+		podErr          error
+	)
+	if sandbox.Spec.Network == nil {
+		pod, recreateRequeue, podErr = r.reconcilePod(ctx, sandbox, nameHash, wd)
+	} else {
+		canCreatePod := networkClaimErr == nil && networkPolicyErr == nil
+		pod, recreateRequeue, podErr = r.reconcilePodWithNetwork(ctx, sandbox, nameHash, wd, canCreatePod, networkClaimName)
+	}
 	podMappingConflict := isMultipleSandboxPodsError(podErr)
 	if podMappingConflict {
 		conditionErrors = errors.Join(conditionErrors, podErr)
 		r.recordMultiplePodsEvent(sandbox, podErr)
 	} else {
 		recordChildErr(podErr)
+	}
+
+	// Clean up any per-Sandbox deny-all NetworkPolicy only once no backing Pod exists
+	// (pod == nil && podErr == nil) so a live or terminating Pod never loses confinement.
+	if sandbox.Spec.Network != nil && pod == nil && podErr == nil {
+		if !sandboxNeedsDenyAllNetworkPolicy(sandbox) || sandbox.Spec.OperatingMode == sandboxv1beta1.SandboxOperatingModeSuspended {
+			recordChildErr(r.deleteNetworkPolicy(ctx, sandbox))
+		}
 	}
 
 	if pod == nil {
@@ -805,7 +838,14 @@ func (r *SandboxReconciler) computeReadyCondition(sandbox *sandboxv1beta1.Sandbo
 			for _, condition := range pod.Status.Conditions {
 				if condition.Type == corev1.PodReady {
 					if condition.Status == corev1.ConditionTrue {
-						if len(pod.Status.PodIPs) == 0 {
+						if sandboxIsPodNetworkIsolated(sandbox) {
+							if pod.Spec.NodeName == "" {
+								message = "Pod is Ready but has no nodeName yet"
+							} else {
+								message = "Pod is Ready"
+								podReady = true
+							}
+						} else if len(pod.Status.PodIPs) == 0 {
 							message = "Pod is Ready but has no podIPs yet"
 						} else {
 							message = "Pod is Ready"
@@ -1714,6 +1754,10 @@ func (r *SandboxReconciler) recordRecreateBackoffEvent(sandbox *sandboxv1beta1.S
 }
 
 func (r *SandboxReconciler) reconcilePod(ctx context.Context, sandbox *sandboxv1beta1.Sandbox, nameHash string, wd *writeDeferral) (*corev1.Pod, time.Duration, error) {
+	return r.reconcilePodWithNetwork(ctx, sandbox, nameHash, wd, true, "")
+}
+
+func (r *SandboxReconciler) reconcilePodWithNetwork(ctx context.Context, sandbox *sandboxv1beta1.Sandbox, nameHash string, wd *writeDeferral, canCreatePod bool, networkClaimName string) (*corev1.Pod, time.Duration, error) {
 	logger := log.FromContext(ctx)
 
 	// Start a child span of ReconcileSandbox
@@ -1992,6 +2036,10 @@ func (r *SandboxReconciler) reconcilePod(ctx context.Context, sandbox *sandboxv1
 		return reconcileExistingPod(pod)
 	}
 
+	if !canCreatePod {
+		return nil, 0, nil
+	}
+
 	// Deployment-style recreate backoff: Owns(Pod) watches are not workqueue
 	// rate-limited, so gate Create after a Failed recreate delete.
 	if sandboxRecreatesFailedPods(sandbox) {
@@ -2052,6 +2100,12 @@ func (r *SandboxReconciler) reconcilePod(ctx context.Context, sandbox *sandboxv1
 	}
 
 	mutatedSpec := sandbox.Spec.PodTemplate.Spec.DeepCopy()
+	if sandbox.Spec.Network != nil {
+		if networkClaimName == "" {
+			networkClaimName = networkResourceClaimName(sandbox.Name)
+		}
+		ApplySandboxNetworkPodSpec(sandbox.Spec.Network, mutatedSpec, networkClaimName)
+	}
 
 	// Build PVC volumes from volumeClaimTemplates
 	var pvcVolumes []corev1.Volume
@@ -2347,10 +2401,14 @@ func (r *SandboxReconciler) handleSandboxExpiry(ctx context.Context, sandbox *sa
 	var allErrors error
 
 	// Delete pod only if owned by this sandbox
+	podGone := false
 	podName := resolvePodName(sandbox)
+	podKey := types.NamespacedName{Name: podName, Namespace: sandbox.Namespace}
 	pod := &corev1.Pod{}
-	if err := r.Get(ctx, types.NamespacedName{Name: podName, Namespace: sandbox.Namespace}, pod); err != nil {
-		if !k8serrors.IsNotFound(err) {
+	if err := r.Get(ctx, podKey, pod); err != nil {
+		if k8serrors.IsNotFound(err) {
+			podGone = true
+		} else {
 			allErrors = errors.Join(allErrors, fmt.Errorf("failed to get pod: %w", err))
 		}
 	} else {
@@ -2359,6 +2417,8 @@ func (r *SandboxReconciler) handleSandboxExpiry(ctx context.Context, sandbox *sa
 		case resourceOwnedBySandbox:
 			if err := r.Delete(ctx, pod); err != nil && !k8serrors.IsNotFound(err) {
 				allErrors = errors.Join(allErrors, fmt.Errorf("failed to delete pod: %w", err))
+			} else if err := r.Get(ctx, podKey, &corev1.Pod{}); k8serrors.IsNotFound(err) {
+				podGone = true
 			}
 		case resourceUnowned:
 			logger.Info("Skipping pod deletion during expiry: pod has no controllerRef pointing to this sandbox",
@@ -2393,11 +2453,24 @@ func (r *SandboxReconciler) handleSandboxExpiry(ctx context.Context, sandbox *sa
 		}
 	}
 
+	if err := r.deleteNetworkResourceClaim(ctx, sandbox); err != nil {
+		allErrors = errors.Join(allErrors, err)
+	}
+	if podGone {
+		if err := r.deleteNetworkPolicy(ctx, sandbox); err != nil {
+			allErrors = errors.Join(allErrors, err)
+		}
+	}
+
 	if sandbox.Spec.ShutdownPolicy != nil && *sandbox.Spec.ShutdownPolicy == sandboxv1beta1.ShutdownPolicyDelete {
-		if err := r.Delete(ctx, sandbox); err != nil && !k8serrors.IsNotFound(err) {
-			allErrors = errors.Join(allErrors, fmt.Errorf("failed to delete sandbox: %w", err))
-		} else {
-			return true, nil
+		// Wait until the Pod is fully gone before deleting a Sandbox that owns a deny-all
+		// NetworkPolicy so background GC does not remove confinement while the Pod terminates.
+		if !sandboxNeedsDenyAllNetworkPolicy(sandbox) || podGone {
+			if err := r.Delete(ctx, sandbox); err != nil && !k8serrors.IsNotFound(err) {
+				allErrors = errors.Join(allErrors, fmt.Errorf("failed to delete sandbox: %w", err))
+			} else {
+				return true, nil
+			}
 		}
 	}
 
@@ -2491,10 +2564,17 @@ func (r *SandboxReconciler) SetupWithManager(mgr ctrl.Manager, concurrentWorkers
 		return err
 	}
 
-	return ctrl.NewControllerManagedBy(mgr).
+	b := ctrl.NewControllerManagedBy(mgr).
 		For(&sandboxv1beta1.Sandbox{}, builder.WithPredicates(r.sandboxCreationMetricsPredicate())).
 		Owns(&corev1.Pod{}, builder.WithPredicates(labelSelectorPredicate)).
 		Owns(&corev1.Service{}, builder.WithPredicates(labelSelectorPredicate)).
+		Owns(&networkingv1.NetworkPolicy{}, builder.WithPredicates(labelSelectorPredicate))
+	if mapper := mgr.GetRESTMapper(); mapper != nil {
+		if _, err := mapper.RESTMapping(resourcev1.SchemeGroupVersion.WithKind("ResourceClaim").GroupKind(), resourcev1.SchemeGroupVersion.Version); err == nil {
+			b = b.Owns(&resourcev1.ResourceClaim{}, builder.WithPredicates(labelSelectorPredicate))
+		}
+	}
+	return b.
 		WithOptions(controller.Options{MaxConcurrentReconciles: concurrentWorkers}).
 		Complete(r)
 }

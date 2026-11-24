@@ -1371,7 +1371,77 @@ func compareSandboxBlueprint(template *extensionsv1beta1.SandboxTemplate, actual
 		compareVolumeClaimTemplates(template, actualSandboxSpec.VolumeClaimTemplates) &&
 		equality.Semantic.DeepEqual(template.Spec.Service, actualSandboxSpec.Service) &&
 		normalizeFailedPodPolicy(template.Spec.FailedPodPolicy) ==
-			normalizeFailedPodPolicy(actualSandboxSpec.FailedPodPolicy)
+			normalizeFailedPodPolicy(actualSandboxSpec.FailedPodPolicy) &&
+		equality.Semantic.DeepEqual(normalizeSandboxNetwork(template.Spec.Network), normalizeSandboxNetwork(actualSandboxSpec.Network))
+}
+
+func normalizeSandboxNetwork(net *sandboxv1beta1.SandboxNetworkSpec) *sandboxv1beta1.SandboxNetworkSpec {
+	if net == nil {
+		return nil
+	}
+	out := net.DeepCopy()
+	if out.DriverName == "" {
+		out.DriverName = sandboxv1beta1.AgentsNetDriverName
+	}
+	if out.DeviceClassName == "" {
+		out.DeviceClassName = out.DriverName
+	}
+	if out.ConfinementMode == "" {
+		out.ConfinementMode = sandboxv1beta1.SandboxConfinementModePodNetworkIsolated
+	}
+	if out.CATrust != nil {
+		if out.CATrust.Mode == "" {
+			out.CATrust.Mode = sandboxv1beta1.SandboxCATrustModeInjectEnv
+		}
+		if out.CATrust.BundleMode == "" {
+			out.CATrust.BundleMode = sandboxv1beta1.SandboxCABundleModeAppendSystemRoots
+		}
+		normalizeCASources(out.CATrust.Sources)
+	}
+	if out.PolicyEnforcementPoint.TLS != nil {
+		normalizeCASources(out.PolicyEnforcementPoint.TLS.CACertificateRefs)
+	}
+	if auth := out.PolicyEnforcementPoint.Auth; auth != nil {
+		switch auth.Type {
+		case sandboxv1beta1.SandboxPEPAuthTypeSPIFFE:
+			if auth.SPIFFE == nil {
+				auth.SPIFFE = &sandboxv1beta1.SandboxSPIFFEAuth{}
+			}
+			if auth.SPIFFE.Mode == "" {
+				auth.SPIFFE.Mode = sandboxv1beta1.SandboxSPIFFEModeNode
+			}
+		case sandboxv1beta1.SandboxPEPAuthTypePodCertificate:
+			if auth.PodCertificate != nil && auth.PodCertificate.KeyType == "" {
+				auth.PodCertificate.KeyType = sandboxv1beta1.SandboxPodCertificateKeyTypeECDSAP256
+			}
+		case sandboxv1beta1.SandboxPEPAuthTypeServiceAccountToken:
+			if auth.ServiceAccountToken != nil {
+				if auth.ServiceAccountToken.Mode == "" {
+					auth.ServiceAccountToken.Mode = sandboxv1beta1.SandboxServiceAccountTokenModeNode
+				}
+				if auth.ServiceAccountToken.ExpirationSeconds == nil {
+					auth.ServiceAccountToken.ExpirationSeconds = new(int32(3600))
+				}
+			}
+		}
+	}
+	for i := range out.IngressPorts {
+		if out.IngressPorts[i].Protocol == "" {
+			out.IngressPorts[i].Protocol = sandboxv1beta1.SandboxIngressProtocolTCP
+		}
+	}
+	return out
+}
+
+func normalizeCASources(sources []sandboxv1beta1.SandboxCASource) {
+	for i := range sources {
+		if sources[i].ConfigMapRef != nil && sources[i].ConfigMapRef.Key == "" {
+			sources[i].ConfigMapRef.Key = "ca.crt"
+		}
+		if sources[i].SecretRef != nil && sources[i].SecretRef.Key == "" {
+			sources[i].SecretRef.Key = "ca.crt"
+		}
+	}
 }
 
 func normalizeFailedPodPolicy(policy sandboxv1beta1.FailedPodPolicy) sandboxv1beta1.FailedPodPolicy {

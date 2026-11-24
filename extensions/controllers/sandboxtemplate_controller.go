@@ -31,6 +31,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
+	sandboxv1beta1 "sigs.k8s.io/agent-sandbox/api/v1beta1"
 	extensionsv1beta1 "sigs.k8s.io/agent-sandbox/extensions/api/v1beta1"
 	asmetrics "sigs.k8s.io/agent-sandbox/internal/metrics"
 )
@@ -81,8 +82,18 @@ func (r *SandboxTemplateReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		management = extensionsv1beta1.NetworkPolicyManagementManaged
 	}
 
-	// 3. Handle "Unmanaged" Opt-Out
-	if management == extensionsv1beta1.NetworkPolicyManagementUnmanaged {
+	// 3. Handle "Unmanaged" Opt-Out and spec.network confinement modes.
+	var skipNetworkPolicy bool
+	if template.Spec.Network != nil {
+		// When spec.network is configured, confinementMode exclusively governs
+		// NetworkPolicy creation: PodNetworkIsolated has no CNI attachment,
+		// while NetworkPolicyDenyAll always enforces a strict deny-all policy.
+		mode := template.Spec.Network.ConfinementMode
+		skipNetworkPolicy = mode == "" || mode == sandboxv1beta1.SandboxConfinementModePodNetworkIsolated
+	} else {
+		skipNetworkPolicy = management == extensionsv1beta1.NetworkPolicyManagementUnmanaged
+	}
+	if skipNetworkPolicy {
 		existingNP := &networkingv1.NetworkPolicy{}
 		err := r.Get(ctx, types.NamespacedName{Name: npName, Namespace: npNamespace}, existingNP)
 		if err == nil {
@@ -103,7 +114,21 @@ func (r *SandboxTemplateReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 
 	// 4. Construct Desired NetworkPolicy Spec
 	var desiredSpec networkingv1.NetworkPolicySpec
-	if template.Spec.NetworkPolicy == nil {
+	if template.Spec.Network != nil && template.Spec.Network.ConfinementMode == sandboxv1beta1.SandboxConfinementModeNetworkPolicyDenyAll {
+		// Enforce deny-all ingress and egress on CNI interfaces so sandbox
+		// traffic must traverse the agents.net plumbing.
+		desiredSpec = networkingv1.NetworkPolicySpec{
+			PodSelector: metav1.LabelSelector{
+				MatchLabels: map[string]string{
+					sandboxTemplateRefHash: SandboxTemplateRefHash(template.Name),
+				},
+			},
+			PolicyTypes: []networkingv1.PolicyType{
+				networkingv1.PolicyTypeIngress,
+				networkingv1.PolicyTypeEgress,
+			},
+		}
+	} else if template.Spec.NetworkPolicy == nil {
 		desiredSpec = buildDefaultNetworkPolicySpec(template.Name)
 	} else {
 		desiredSpec = networkingv1.NetworkPolicySpec{

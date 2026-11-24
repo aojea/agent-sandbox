@@ -753,6 +753,58 @@ func TestCache_EmptyCachedPodUIDFallsBackToEviction(t *testing.T) {
 	}
 }
 
+func TestCache_AgentsNetZeroPodIP(t *testing.T) {
+	pod := makePod("iso-sb", testPodNS, testUID, "", true)
+	pod.UID = types.UID("iso-pod-uid-1")
+	pod.Spec.NodeName = "worker-1"
+	pod.Spec.ResourceClaims = []corev1.PodResourceClaim{
+		{Name: sandboxv1beta1.AgentsNetPodClaimName},
+	}
+	pod.Status.HostIP = "192.168.10.2"
+
+	// Default cache (IncludeAgentsNet=false) skips zero-PodIP Pods.
+	cDefault := &Cache{
+		log:     logr.Discard(),
+		entries: make(map[types.UID]Entry),
+		byName:  make(map[string]types.UID),
+	}
+	cDefault.onAddOrUpdate(pod)
+	if _, ok := cDefault.Get(testUID); ok {
+		t.Fatal("default cache must ignore zero-PodIP agents.net Pods")
+	}
+
+	// Cache with IncludeAgentsNet=true admits Ready zero-PodIP agents.net Pods with HostIP.
+	cNet := &Cache{
+		log:              logr.Discard(),
+		includeAgentsNet: true,
+		entries:          make(map[types.UID]Entry),
+		byName:           make(map[string]types.UID),
+	}
+	cNet.onAddOrUpdate(pod)
+	got, ok := cNet.Get(testUID)
+	if !ok {
+		t.Fatal("agents.net cache must admit Ready zero-PodIP Pod with HostIP")
+	}
+	if !got.UsesAgentsNet || got.HostIP != "192.168.10.2" || got.PodUID != "iso-pod-uid-1" || got.PodIP != "" {
+		t.Fatalf("unexpected cached entry: %+v", got)
+	}
+
+	// Invalidate ignores stale HostIP when the entry was already refreshed.
+	podMoved := pod.DeepCopy()
+	podMoved.Status.HostIP = "192.168.10.3"
+	cNet.onAddOrUpdate(podMoved)
+	if cNet.Invalidate(got) {
+		t.Fatal("Invalidate must ignore stale HostIP after refresh")
+	}
+	latest, ok := cNet.Get(testUID)
+	if !ok || latest.HostIP != "192.168.10.3" {
+		t.Fatalf("refreshed entry lost: ok=%v entry=%+v", ok, latest)
+	}
+	if !cNet.Invalidate(latest) {
+		t.Fatal("Invalidate must evict matching current HostIP entry")
+	}
+}
+
 func TestApiVersionInGroup(t *testing.T) {
 	cases := map[string]bool{
 		"agents.x-k8s.io/v1beta1":  true,

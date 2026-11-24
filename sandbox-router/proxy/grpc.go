@@ -127,7 +127,9 @@ func writeProxyError(w http.ResponseWriter, r *http.Request, kind protocolKind, 
 			code = codes.Unauthenticated
 		case http.StatusForbidden:
 			code = codes.PermissionDenied
-		case http.StatusBadGateway:
+		case http.StatusNotFound:
+			code = codes.NotFound
+		case http.StatusBadGateway, http.StatusServiceUnavailable:
 			code = codes.Unavailable
 		case http.StatusRequestEntityTooLarge:
 			code = codes.ResourceExhausted

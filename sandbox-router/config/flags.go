@@ -254,6 +254,19 @@ func RegisterFlags(fs *flag.FlagSet, c *Config, lookup LookupEnvFunc) {
 	fs.StringVar(&c.CacheNamespace, "cache-namespace", c.CacheNamespace,
 		"Optional namespace filter for the Pod informer. Empty means "+
 			"cluster-wide. Ignored when --cache-enabled=false.")
+	fs.IntVar(&c.AgentsNetIngressPort, "agents-net-ingress-port", c.AgentsNetIngressPort,
+		"Host port of the node-local agents.net HTTP CONNECT ingress bridge "+
+			"(e.g. 15080). 0 disables agents.net ingress routing.")
+	fs.StringVar(&c.AgentsNetIngressCAFile, "agents-net-ingress-ca-file", c.AgentsNetIngressCAFile,
+		"Optional PEM CA bundle path to enable TLS and verify agents.net "+
+			"ingress bridge certificates.")
+	fs.StringVar(&c.AgentsNetIngressCertFile, "agents-net-ingress-cert-file", c.AgentsNetIngressCertFile,
+		"Optional PEM client certificate path for mTLS to the agents.net "+
+			"ingress bridge.")
+	fs.StringVar(&c.AgentsNetIngressKeyFile, "agents-net-ingress-key-file", c.AgentsNetIngressKeyFile,
+		"Optional PEM client key path for mTLS to the agents.net ingress bridge.")
+	fs.StringVar(&c.AgentsNetIngressServerName, "agents-net-ingress-server-name", c.AgentsNetIngressServerName,
+		"Optional TLS ServerName override when verifying the node-local agents.net ingress bridge certificate.")
 	// controller-runtime's pkg/client/config registers a "kubeconfig"
 	// flag in its package init. Detect that and reuse the existing
 	// flag rather than redefining it (Go's flag package panics on

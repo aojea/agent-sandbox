@@ -75,8 +75,16 @@ type Entry struct {
 
 	// PodIP is the IPv4/IPv6 address of the sandbox Pod. The ext_proc
 	// handler combines this with the inbound X-Sandbox-Port to build the
-	// upstream target.
+	// upstream target. Empty for PodNetworkIsolated (KEP-6313) Pods.
 	PodIP string
+
+	// HostIP is the IP address of the node hosting the Pod. Used when
+	// routing agents.net Pods through the node-local ingress bridge.
+	HostIP string
+
+	// UsesAgentsNet is true when the Pod references an agents.net DRA
+	// ResourceClaim (spec.resourceClaims[].name == sandboxv1beta1.AgentsNetPodClaimName).
+	UsesAgentsNet bool
 
 	// SandboxName is the human-readable Sandbox CR name, taken from the
 	// Pod's controller OwnerReference. It usually equals Pod.Name, but not
@@ -107,11 +115,12 @@ const (
 // background Pod informer. Lookups are O(1) and lock-free for the common
 // path (RLock + map read).
 type Cache struct {
-	log      logr.Logger
-	informer cache.SharedIndexInformer
-	factory  informers.SharedInformerFactory
-	stopOnce sync.Once
-	stopCh   chan struct{}
+	log              logr.Logger
+	informer         cache.SharedIndexInformer
+	factory          informers.SharedInformerFactory
+	includeAgentsNet bool
+	stopOnce         sync.Once
+	stopCh           chan struct{}
 
 	mu      sync.RWMutex
 	entries map[types.UID]Entry
@@ -126,10 +135,11 @@ type Cache struct {
 // Options configure the cache. Namespace is empty for cluster-wide
 // (recommended for the router; sandbox Pods can live in many namespaces).
 type Options struct {
-	Client    kubernetes.Interface
-	Log       logr.Logger
-	Namespace string
-	Resync    time.Duration
+	Client           kubernetes.Interface
+	Log              logr.Logger
+	Namespace        string
+	Resync           time.Duration
+	IncludeAgentsNet bool
 }
 
 // New constructs a Cache backed by a filtered Pod SharedInformer. The
@@ -151,9 +161,15 @@ func New(o Options) (*Cache, error) {
 	}
 	tweak := func(opts *metav1.ListOptions) {
 		opts.LabelSelector = labels.NewSelector().Add(*hashSel).String()
-		// Skip Pods that have been scheduled but have no IP yet — they
-		// can't be a useful routing target. Apiserver-side filter.
-		opts.FieldSelector = fields.OneTermNotEqualSelector("status.podIP", "").String()
+		if o.IncludeAgentsNet {
+			// Include PodNetworkIsolated (KEP-6313) Pods that have no PodIP
+			// while still filtering out unscheduled Pods server-side.
+			opts.FieldSelector = fields.OneTermNotEqualSelector("spec.nodeName", "").String()
+		} else {
+			// Skip Pods that have been scheduled but have no IP yet — they
+			// can't be a useful routing target. Apiserver-side filter.
+			opts.FieldSelector = fields.OneTermNotEqualSelector("status.podIP", "").String()
+		}
 	}
 
 	factory := informers.NewSharedInformerFactoryWithOptions(
@@ -164,12 +180,13 @@ func New(o Options) (*Cache, error) {
 	podInformer := factory.Core().V1().Pods().Informer()
 
 	c := &Cache{
-		log:      o.Log,
-		informer: podInformer,
-		factory:  factory,
-		stopCh:   make(chan struct{}),
-		entries:  make(map[types.UID]Entry),
-		byName:   make(map[string]types.UID),
+		log:              o.Log,
+		informer:         podInformer,
+		factory:          factory,
+		includeAgentsNet: o.IncludeAgentsNet,
+		stopCh:           make(chan struct{}),
+		entries:          make(map[types.UID]Entry),
+		byName:           make(map[string]types.UID),
 	}
 
 	if _, err := podInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
@@ -282,7 +299,8 @@ func (c *Cache) onAddOrUpdate(obj any) {
 		return
 	}
 	uid := owner.UID
-	if !podReady(pod) || pod.Status.PodIP == "" {
+	usesAgentsNet := podUsesAgentsNet(pod)
+	if !podReady(pod) || (pod.Status.PodIP == "" && (!c.includeAgentsNet || !usesAgentsNet || pod.Status.HostIP == "")) {
 		c.removePod(uid, pod.UID)
 		return
 	}
@@ -294,11 +312,22 @@ func (c *Cache) onAddOrUpdate(obj any) {
 	// label, and the resulting Pod update indexes the entry.
 	_, unclaimed := pod.Labels[sandboxv1beta1.SandboxWarmPoolLabel]
 	c.upsert(uid, Entry{
-		PodUID:      pod.UID,
-		PodIP:       pod.Status.PodIP,
-		SandboxName: owner.Name,
-		Namespace:   pod.Namespace,
+		PodUID:        pod.UID,
+		PodIP:         pod.Status.PodIP,
+		HostIP:        pod.Status.HostIP,
+		UsesAgentsNet: usesAgentsNet,
+		SandboxName:   owner.Name,
+		Namespace:     pod.Namespace,
 	}, !unclaimed)
+}
+
+func podUsesAgentsNet(pod *corev1.Pod) bool {
+	for i := range pod.Spec.ResourceClaims {
+		if pod.Spec.ResourceClaims[i].Name == sandboxv1beta1.AgentsNetPodClaimName {
+			return true
+		}
+	}
+	return false
 }
 
 func (c *Cache) onUpdate(oldObj, newObj any) {
@@ -428,7 +457,7 @@ func (c *Cache) removeLocked(uid types.UID) bool {
 func (c *Cache) Invalidate(dialed Entry) bool {
 	c.mu.Lock()
 	cur, found := c.entries[dialed.SandboxUID]
-	refreshed := found && (cur.PodUID != dialed.PodUID || cur.PodIP != dialed.PodIP)
+	refreshed := found && (cur.PodUID != dialed.PodUID || cur.PodIP != dialed.PodIP || cur.HostIP != dialed.HostIP)
 	var existed bool
 	if found && !refreshed {
 		existed = c.removeLocked(dialed.SandboxUID)

@@ -190,6 +190,9 @@ func isRetriableDialError(err error) bool {
 	if err == nil {
 		return false
 	}
+	if _, ok := errors.AsType[*agentsNetIngressTransientError](err); ok {
+		return true
+	}
 	if _, ok := errors.AsType[*net.DNSError](err); ok {
 		return true
 	}
@@ -211,6 +214,9 @@ func isRetriableDialError(err error) bool {
 // the cache entry it came from is not stale and must not be evicted.
 func isDeadHostDialError(err error) bool {
 	if !isRetriableDialError(err) {
+		return false
+	}
+	if _, ok := errors.AsType[*agentsNetIngressTransientError](err); ok {
 		return false
 	}
 	return !errors.Is(err, syscall.ECONNREFUSED)

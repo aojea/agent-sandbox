@@ -23,6 +23,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -337,8 +338,22 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		upstreamURL.RawPath = r.URL.EscapedPath()
 	}
 	upstreamURL.RawQuery = outboundRawQuery
+	var ingressTarget *agentsNetIngressTarget
+	if h.cfg.AgentsNetIngressPort > 0 && resolved.UsesAgentsNet && resolved.HostIP != "" && resolved.PodUID != "" {
+		// Route agents.net Pods through the node-local HTTP CONNECT ingress bridge.
+		// Keying upstreamURL.Host by PodUID isolates http.Transport connection pools per Pod.
+		upstreamURL.Host = net.JoinHostPort(string(resolved.PodUID)+".agents-net.local", strconv.Itoa(target0.Port))
+		ingressTarget = &agentsNetIngressTarget{
+			BridgeAddr: net.JoinHostPort(resolved.HostIP, strconv.Itoa(h.cfg.AgentsNetIngressPort)),
+			PodUID:     string(resolved.PodUID),
+			Port:       target0.Port,
+		}
+	}
 	rp := &httputil.ReverseProxy{
 		Rewrite: func(pr *httputil.ProxyRequest) {
+			if ingressTarget != nil {
+				pr.Out = pr.Out.WithContext(withAgentsNetIngressTarget(pr.Out.Context(), *ingressTarget))
+			}
 			pr.Out.URL = upstreamURL
 			// Clear inbound Host so net/http picks the URL host. Matches the
 			// Python router's behavior of stripping Host before forwarding.
@@ -421,6 +436,22 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		Transport:     h.transport,
 		FlushInterval: -1, // immediate flush for SSE / streaming responses
 		ErrorHandler: func(w http.ResponseWriter, errReq *http.Request, err error) {
+			if denied, ok := errors.AsType[*agentsNetIngressDeniedError](err); ok {
+				h.recordUpstreamErrorReason(target0.Namespace, "ingress_denied")
+				writeProxyError(w, errReq, kind, &Error{
+					Status: denied.Status,
+					Detail: denied.Error(),
+				})
+				return
+			}
+			if transient, ok := errors.AsType[*agentsNetIngressTransientError](err); ok {
+				h.recordUpstreamErrorReason(target0.Namespace, "ingress_unavailable")
+				writeProxyError(w, errReq, kind, &Error{
+					Status: transient.Status,
+					Detail: transient.Error(),
+				})
+				return
+			}
 			var bodyLimit *http.MaxBytesError
 			if grpcRequest && errors.As(err, &bodyLimit) {
 				writeProxyError(w, errReq, kind, &Error{
@@ -461,7 +492,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			// nothing useful to evict. Either cache path resolved a full
 			// entry, so evict exactly that entry: one a recreated Pod
 			// refreshed mid-dial survives, even if it reused the IP.
-			if h.cache != nil && isDeadHostDialError(err) && (src == SourceCache || src == SourceCacheName) {
+			if h.cache != nil && isDeadHostDialError(err) && (src == SourceCache || src == SourceCacheName) && (!resolved.UsesAgentsNet || resolved.PodIP != "") {
 				invalidated := h.cache.Invalidate(resolved)
 				if invalidated && h.metrics != nil {
 					h.metrics.CacheInvalidationsTotal.WithLabelValues(target0.Namespace).Inc()
@@ -597,11 +628,16 @@ func isUpgradeRequest(r *http.Request) bool {
 // in the worst case Pod-IP traffic leaves the cluster. Defaulting to
 // no proxy makes "router goes direct to the sandbox" the guarantee.
 func defaultTransport(cfg *config.Config) *http.Transport {
+	baseDial := (&net.Dialer{
+		Timeout:   30 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}).DialContext
+	dialFn := baseDial
+	if cfg != nil && cfg.AgentsNetIngressPort > 0 {
+		dialFn = wrapAgentsNetDialer(baseDial, cfg)
+	}
 	return &http.Transport{
-		DialContext: (&net.Dialer{
-			Timeout:   30 * time.Second,
-			KeepAlive: 30 * time.Second,
-		}).DialContext,
+		DialContext:           dialFn,
 		ForceAttemptHTTP2:     false,
 		MaxIdleConns:          200,
 		MaxIdleConnsPerHost:   16,

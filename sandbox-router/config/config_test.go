@@ -677,6 +677,56 @@ func TestValidate(t *testing.T) {
 			},
 			wantErr: "",
 		},
+		{
+			name: "agents.net ingress port valid with cache enabled",
+			mut: func(c *Config) {
+				c.CacheEnabled = true
+				c.AgentsNetIngressPort = 15080
+			},
+			wantErr: "",
+		},
+		{
+			name: "agents.net ingress port with mTLS valid",
+			mut: func(c *Config) {
+				c.CacheEnabled = true
+				c.AgentsNetIngressPort = 15080
+				c.AgentsNetIngressCAFile = "/etc/tls/ca.crt"
+				c.AgentsNetIngressCertFile = "/etc/tls/tls.crt"
+				c.AgentsNetIngressKeyFile = "/etc/tls/tls.key"
+			},
+			wantErr: "",
+		},
+		{
+			name: "agents.net ingress port requires cache enabled",
+			mut: func(c *Config) {
+				c.AgentsNetIngressPort = 15080
+			},
+			wantErr: "--agents-net-ingress-port requires --cache-enabled",
+		},
+		{
+			name: "agents.net ingress port out of range",
+			mut: func(c *Config) {
+				c.CacheEnabled = true
+				c.AgentsNetIngressPort = 70000
+			},
+			wantErr: "--agents-net-ingress-port must be between 0 and 65535",
+		},
+		{
+			name: "agents.net ingress cert without key rejected",
+			mut: func(c *Config) {
+				c.CacheEnabled = true
+				c.AgentsNetIngressPort = 15080
+				c.AgentsNetIngressCertFile = "/etc/tls/tls.crt"
+			},
+			wantErr: "--agents-net-ingress-cert-file and --agents-net-ingress-key-file must be set together",
+		},
+		{
+			name: "agents.net ingress CA without port rejected",
+			mut: func(c *Config) {
+				c.AgentsNetIngressCAFile = "/etc/tls/ca.crt"
+			},
+			wantErr: "require --agents-net-ingress-port > 0",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -692,5 +742,28 @@ func TestValidate(t *testing.T) {
 				t.Fatalf("expected error containing %q, got: %v", tc.wantErr, err)
 			}
 		})
+	}
+}
+
+func TestRegisterFlagsAgentsNetIngress(t *testing.T) {
+	c := Defaults()
+	fs := flag.NewFlagSet("test", flag.ContinueOnError)
+	fs.SetOutput(&strings.Builder{})
+	RegisterFlags(fs, &c, fakeEnv(nil))
+	if err := fs.Parse([]string{
+		"--cache-enabled=true",
+		"--agents-net-ingress-port=15080",
+		"--agents-net-ingress-ca-file=/etc/tls/ca.crt",
+		"--agents-net-ingress-cert-file=/etc/tls/tls.crt",
+		"--agents-net-ingress-key-file=/etc/tls/tls.key",
+	}); err != nil {
+		t.Fatalf("parse agents-net ingress flags: %v", err)
+	}
+	if err := c.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	if c.AgentsNetIngressPort != 15080 || c.AgentsNetIngressCAFile != "/etc/tls/ca.crt" ||
+		c.AgentsNetIngressCertFile != "/etc/tls/tls.crt" || c.AgentsNetIngressKeyFile != "/etc/tls/tls.key" {
+		t.Fatalf("unexpected parsed config: %+v", c)
 	}
 }

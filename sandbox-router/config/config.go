@@ -361,6 +361,25 @@ type Config struct {
 	// cross-origin requests are still proxied but the browser blocks the
 	// response. Each entry has the form scheme://host[:port].
 	GRPCWebAllowedOrigins []string
+
+	// AgentsNetIngressPort, when > 0, routes requests for agents.net Pods
+	// through the node-local agents.net HTTP CONNECT ingress bridge on
+	// <Pod.Status.HostIP>:<AgentsNetIngressPort> instead of dialing PodIP.
+	// Required to reach PodNetworkIsolated (no PodIP) and NetworkPolicyDenyAll
+	// sandboxes over their declared spec.network.ingressPorts. Zero disables
+	// agents.net ingress bridging.
+	AgentsNetIngressPort int
+	// AgentsNetIngressCAFile optionally points to a PEM CA bundle used to
+	// enable TLS and verify the node-local agents.net ingress listener.
+	AgentsNetIngressCAFile string
+	// AgentsNetIngressCertFile and AgentsNetIngressKeyFile optionally configure
+	// a PEM client certificate and key for mTLS to the agents.net ingress bridge.
+	AgentsNetIngressCertFile string
+	AgentsNetIngressKeyFile  string
+	// AgentsNetIngressServerName optionally overrides the TLS ServerName (SNI and
+	// certificate DNS SAN verification) used when connecting to the node-local
+	// agents.net ingress bridge (otherwise defaults to the node HostIP).
+	AgentsNetIngressServerName string
 }
 
 // Defaults returns a Config populated with the default values used when no
@@ -556,6 +575,18 @@ func (c *Config) Validate() error {
 	}
 	if c.AuthzTrustForwardedProto && c.AuthzCookieName == "" {
 		return errors.New("--authz-trust-forwarded-proto has no effect without --authz-cookie-name, which is what runs the same-origin check it affects")
+	}
+	if c.AgentsNetIngressPort < 0 || c.AgentsNetIngressPort > 65535 {
+		return fmt.Errorf("--agents-net-ingress-port must be between 0 and 65535, got %d", c.AgentsNetIngressPort)
+	}
+	if c.AgentsNetIngressPort > 0 && !c.CacheEnabled {
+		return errors.New("--agents-net-ingress-port requires --cache-enabled to resolve agents.net Pods and host IPs")
+	}
+	if (c.AgentsNetIngressCertFile != "") != (c.AgentsNetIngressKeyFile != "") {
+		return errors.New("--agents-net-ingress-cert-file and --agents-net-ingress-key-file must be set together")
+	}
+	if c.AgentsNetIngressPort == 0 && (c.AgentsNetIngressCAFile != "" || c.AgentsNetIngressCertFile != "" || c.AgentsNetIngressServerName != "") {
+		return errors.New("--agents-net-ingress-ca-file, client cert, and server-name flags require --agents-net-ingress-port > 0")
 	}
 	return nil
 }
